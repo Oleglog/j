@@ -29,8 +29,9 @@ j/
 ├── internal/
 │   ├── xmpp/                  # WebSocket + ANONYMOUS SASL + bind + MUC + focus + SM (XEP-0198)
 │   ├── jingle/                # Jingle session-initiate ↔ SDP конвертер (BUNDLE, RTP, RTCP-FB, SSRC)
-│   └── colibri/               # bridge channel WebSocket — JVB protocol (EndpointMessage, LastN, …)
-├── cmd/cli/                   # CLI: 4 режима (jingle, chat, dc, dc-raw)
+│   ├── colibri/               # bridge channel WebSocket — JVB protocol (EndpointMessage, LastN, …)
+│   └── peer/                  # pion *PeerConnection ↔ Jingle bridge (Accept, transport-info, source-add)
+├── cmd/cli/                   # CLI: 5 режимов (jingle, chat, dc, dc-raw, media)
 ```
 
 ## Протокол
@@ -146,6 +147,42 @@ sess.DataChannel  // SCTP DC параметры (если бридж его пр
 sess.ColibriWS    // bridge WS URL
 ```
 
+### Полный pion-цикл: pion + Jingle session-accept
+
+```go
+import "github.com/pion/webrtc/v4"
+
+pc, _ := webrtc.NewPeerConnection(sess.IceConfig())
+pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly})
+pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly})
+
+pc.OnTrack(func(t *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+    // принимаем пакеты — это RTP от участников
+    buf := make([]byte, 1500)
+    for { _, _, err := t.Read(buf); if err != nil { return } }
+})
+
+neg := sess.Negotiator()
+neg.PC = pc
+if err := neg.Accept(ctx); err != nil { panic(err) }     // SDP↔Jingle, шлёт session-accept
+defer neg.Terminate("success")
+
+// trickle ICE / source updates:
+neg.SendTransportInfo("video", "candidate:… typ host …")
+neg.SendSourceAdd(`<content name="audio">…</content>`)
+neg.SendSourceRemove(`<content name="audio">…</content>`)
+```
+
+### Низкоуровневый XMPP / Jingle
+
+```go
+xc := sess.LowLevel()                // *xmpp.Conn
+xc.Send(`<message …>…</message>`)    // любая стэнза
+xc.SendJingle(to, "transport-info", sid, initiator, innerXML)
+id := xc.NextID()
+stanza := xc.LastJingleStanza()      // raw session-initiate
+```
+
 ## CLI
 
 ```sh
@@ -162,19 +199,23 @@ go run ./cmd/cli -host meet.example.com -room myroom -nick thejproject -dc
 go run ./cmd/cli -host meet.example.com -room myroom -nick alice -dc-raw <input.bin
 go run ./cmd/cli -host meet.example.com -room myroom -nick bob   -dc-raw >output.bin
 
+# media: pion + session-accept + приём RTP
+go run ./cmd/cli -host meet.example.com -room myroom -nick thejproject -media
+
 # флаги
 -host           Jitsi-сервер (например meet.example.com)
 -room           имя комнаты
 -nick           отображаемое имя (по умолчанию thejproject)
 -debug          подробный лог XMPP/WS
 -timeout 5m    сколько ждать Jingle session-initiate
--chat | -dc | -dc-raw   режим (по умолчанию — режим Jingle: вывести данные сессии)
+-chat | -dc | -dc-raw | -media   режим (по умолчанию — режим Jingle: вывести данные сессии)
 ```
 
 ## Зависимости
 
 - Go 1.21+
 - `github.com/coder/websocket`
+- `github.com/pion/webrtc/v4` (для медиа)
 
 ## Сборка
 

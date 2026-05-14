@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -21,6 +22,7 @@ func main() {
 	debug := flag.Bool("debug", false, "Verbose XMPP logging")
 	chat := flag.Bool("chat", false, "Chat mode: join room and read stdin for messages")
 	dc := flag.Bool("dc", false, "DataChannel PoC: wait for Jingle, set up PeerConnection, send messages from stdin")
+	dcRaw := flag.Bool("dc-raw", false, "DataChannel PoC raw mode: pipe stdin as binary base64 frames, print received frames decoded to stdout")
 	timeout := flag.Duration("timeout", 5*time.Minute, "Timeout waiting for Jingle session")
 	flag.Parse()
 
@@ -35,6 +37,8 @@ func main() {
 	fmt.Fprintf(os.Stderr, "joining %s/%s as %s...\n", *host, *room, *nick)
 
 	switch {
+	case *dcRaw:
+		runDCRaw(ctx, *host, *room, *nick, *debug, *timeout)
 	case *dc:
 		runDC(ctx, *host, *room, *nick, *debug, *timeout)
 	case *chat:
@@ -128,6 +132,85 @@ func runJingle(ctx context.Context, host, room, nick string, debug bool, timeout
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	enc.Encode(out)
+}
+
+func runDCRaw(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration) {
+	jctx, jcancel := context.WithTimeout(ctx, timeout)
+	defer jcancel()
+
+	fmt.Fprintln(os.Stderr, "waiting for jingle session-initiate (needs 2nd participant in room)...")
+	sess, err := j.Join(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer sess.Close()
+
+	if sess.ColibriWS == "" {
+		fmt.Fprintln(os.Stderr, "no colibri-ws URL in jingle offer")
+		os.Exit(1)
+	}
+
+	wsConn, _, err := websocket.Dial(ctx, sess.ColibriWS, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "colibri ws dial: %v\n", err)
+		os.Exit(1)
+	}
+	defer wsConn.Close(websocket.StatusNormalClosure, "")
+
+	fmt.Fprintln(os.Stderr, "colibri-ws connected. raw mode: stdin chunks → base64 → broadcast.")
+
+	// reader: parse incoming EndpointMessage and decode b64 -> stdout
+	go func() {
+		for {
+			_, data, err := wsConn.Read(ctx)
+			if err != nil {
+				return
+			}
+			var msg map[string]any
+			if err := json.Unmarshal(data, &msg); err != nil {
+				continue
+			}
+			if msg["colibriClass"] != "EndpointMessage" {
+				continue
+			}
+			b64, ok := msg["b64"].(string)
+			if !ok {
+				continue
+			}
+			raw, err := base64.StdEncoding.DecodeString(b64)
+			if err != nil {
+				continue
+			}
+			os.Stdout.Write(raw)
+		}
+	}()
+
+	// stdin: read 4KB chunks, send each as one EndpointMessage
+	buf := make([]byte, 4096)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		n, err := os.Stdin.Read(buf)
+		if n > 0 {
+			payload := map[string]any{
+				"colibriClass": "EndpointMessage",
+				"to":           "",
+				"b64":          base64.StdEncoding.EncodeToString(buf[:n]),
+			}
+			data, _ := json.Marshal(payload)
+			if werr := wsConn.Write(ctx, websocket.MessageText, data); werr != nil {
+				fmt.Fprintf(os.Stderr, "ws send: %v\n", werr)
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 func runDC(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration) {

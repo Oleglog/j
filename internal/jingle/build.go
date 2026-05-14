@@ -51,6 +51,15 @@ type sharedTransport struct {
 
 func extractSharedTransport(s sdpSplit) sharedTransport {
 	var st sharedTransport
+
+	// session-level (before m=) — pion often puts fingerprint/ice there
+	sessionLines := splitLines(s.session)
+	st.ufrag = getAttr(sessionLines, "ice-ufrag")
+	st.pwd = getAttr(sessionLines, "ice-pwd")
+	st.fingerprint = getAttr(sessionLines, "fingerprint")
+	st.setup = getAttr(sessionLines, "setup")
+
+	// media-level overrides / supplements
 	for _, sec := range s.media {
 		lines := splitLines(sec)
 		if st.ufrag == "" {

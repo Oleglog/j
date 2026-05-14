@@ -365,6 +365,11 @@ func (c *Conn) LowerHand(room string) error {
 	return c.send(fmt.Sprintf(`<presence to="%s" xmlns="jabber:client"><jitsi_participant_raisedHand/></presence>`, roomJID))
 }
 
+func (c *Conn) LeaveMUC(room string) error {
+	roomJID := fmt.Sprintf("%s@conference.%s/%s", room, c.host, c.nick)
+	return c.send(fmt.Sprintf(`<presence to="%s" type="unavailable" xmlns="jabber:client"/>`, roomJID))
+}
+
 func extractJID(s string) string {
 	start := strings.Index(s, "<jid>")
 	if start == -1 {

@@ -3,6 +3,7 @@ package j
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/zarazaex69/j/internal/jingle"
 	"github.com/zarazaex69/j/internal/xmpp"
@@ -53,6 +54,11 @@ func (s *Session) LowerHand() error {
 }
 
 func (s *Session) Close() error {
+	if s.room != "" {
+		_ = s.Conn.LeaveMUC(s.room)
+		// give server a moment to receive it
+		time.Sleep(100 * time.Millisecond)
+	}
 	return s.Conn.Close()
 }
 

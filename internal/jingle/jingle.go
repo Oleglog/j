@@ -34,6 +34,7 @@ type Parsed struct {
 	SID          string
 	Initiator    string
 	SDP          string
+	Jingle       *XMLJingle
 	Candidates   []Candidate
 	AudioSources []Source
 	VideoSources []Source

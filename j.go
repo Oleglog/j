@@ -3,6 +3,7 @@ package j
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/zarazaex69/j/internal/jingle"
@@ -20,6 +21,78 @@ type ICEServer struct {
 	URLs       []string
 	Username   string
 	Credential string
+}
+
+// Message is an incoming groupchat message.
+type Message struct {
+	From string // nickname of sender (resource part of JID)
+	Body string
+}
+
+// Messages returns a channel that delivers incoming groupchat messages.
+// Messages from the local user are filtered out.
+func (s *Session) Messages() <-chan Message {
+	out := make(chan Message, 32)
+	go func() {
+		defer close(out)
+		for stanza := range s.Conn.Stanzas() {
+			if !strings.Contains(stanza, "type='groupchat'") && !strings.Contains(stanza, `type="groupchat"`) {
+				continue
+			}
+			body := extractTagText(stanza, "body")
+			if body == "" {
+				continue
+			}
+			from := extractAttrAny(stanza, "from")
+			// from = room@conference.host/nick
+			nick := from
+			if i := strings.LastIndex(from, "/"); i != -1 {
+				nick = from[i+1:]
+			}
+			// skip our own echo
+			if nick == s.Conn.Nick() {
+				continue
+			}
+			out <- Message{From: nick, Body: body}
+		}
+	}()
+	return out
+}
+
+func extractTagText(s, tag string) string {
+	open := "<" + tag + ">"
+	i := strings.Index(s, open)
+	if i == -1 {
+		return ""
+	}
+	i += len(open)
+	end := strings.Index(s[i:], "</"+tag+">")
+	if end == -1 {
+		return ""
+	}
+	return unescapeXML(s[i : i+end])
+}
+
+func extractAttrAny(s, attr string) string {
+	for _, q := range []string{`'`, `"`} {
+		key := attr + "=" + q
+		i := strings.Index(s, key)
+		if i == -1 {
+			continue
+		}
+		i += len(key)
+		end := strings.Index(s[i:], q)
+		if end == -1 {
+			continue
+		}
+		return s[i : i+end]
+	}
+	return ""
+}
+
+func unescapeXML(s string) string {
+	r := strings.NewReplacer("&lt;", "<", "&gt;", ">", "&quot;", `"`, "&apos;", "'", "&amp;", "&")
+	return r.Replace(s)
 }
 
 type Session struct {

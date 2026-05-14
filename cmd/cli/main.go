@@ -58,11 +58,18 @@ func runChat(ctx context.Context, host, room, nick string, debug bool) {
 		close(lines)
 	}()
 
+	incoming := sess.Messages()
+
 	for {
 		select {
 		case <-ctx.Done():
 			fmt.Fprintln(os.Stderr, "\nbye")
 			return
+		case m, ok := <-incoming:
+			if !ok {
+				return
+			}
+			fmt.Printf("<%s> %s\n", m.From, m.Body)
 		case line, ok := <-lines:
 			if !ok {
 				return

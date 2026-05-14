@@ -66,6 +66,9 @@ func Dial(ctx context.Context, host, room string, debug bool) (*Conn, error) {
 func (c *Conn) JID() string  { return c.jid }
 func (c *Conn) Nick() string { return c.nick }
 
+// Stanzas returns the channel of incoming non-management XMPP stanzas.
+func (c *Conn) Stanzas() <-chan string { return c.stanzas }
+
 func (c *Conn) Close() error {
 	select {
 	case <-c.closed:

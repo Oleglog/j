@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/zarazaex69/j/internal/colibri"
 	"github.com/zarazaex69/j/internal/jingle"
 	"github.com/zarazaex69/j/internal/xmpp"
 )
@@ -106,9 +108,73 @@ type Session struct {
 	VideoSSRC    []jingle.Source
 	ColibriWS    string // bridge WebSocket URL — use for sending EndpointMessage to other participants
 	Conn         *xmpp.Conn
+
+	bridge       *colibri.Conn
+	bridgeMu     sync.Mutex
 	room         string
 	jingleSID    string
 	initiator    string
+}
+
+// BridgeMessage is the type returned by the Bridge() channel — see internal/colibri.Message.
+type BridgeMessage = colibri.Message
+
+// OpenBridge connects to the Jitsi bridge channel (colibri-ws) using the URL from the
+// Jingle session-initiate. Subsequent calls return the existing connection.
+func (s *Session) OpenBridge(ctx context.Context) error {
+	s.bridgeMu.Lock()
+	defer s.bridgeMu.Unlock()
+	if s.bridge != nil {
+		return nil
+	}
+	if s.ColibriWS == "" {
+		return fmt.Errorf("no colibri-ws URL in jingle offer; need session-initiate from Jicofo first")
+	}
+	br, err := colibri.Dial(ctx, s.ColibriWS)
+	if err != nil {
+		return err
+	}
+	s.bridge = br
+	return nil
+}
+
+// Bridge returns the underlying bridge connection (after OpenBridge).
+func (s *Session) Bridge() *colibri.Conn {
+	s.bridgeMu.Lock()
+	defer s.bridgeMu.Unlock()
+	return s.bridge
+}
+
+// BridgeSendRaw sends arbitrary opaque bytes through the bridge channel as a single
+// broadcast EndpointMessage. The bytes are base64-encoded; use BridgeMessages and
+// colibri.DecodeRaw on the receiver.
+//
+// to == "" means broadcast.
+func (s *Session) BridgeSendRaw(to string, data []byte) error {
+	br := s.Bridge()
+	if br == nil {
+		return fmt.Errorf("bridge not open; call OpenBridge first")
+	}
+	return br.SendRaw(to, data)
+}
+
+// BridgeSendMessage sends a JSON EndpointMessage (broadcast or unicast).
+// extras are merged at the top level (e.g. {"text": "hi"} or {"type":"foo","x":1}).
+func (s *Session) BridgeSendMessage(to string, extras map[string]any) error {
+	br := s.Bridge()
+	if br == nil {
+		return fmt.Errorf("bridge not open; call OpenBridge first")
+	}
+	return br.SendEndpointMessage(to, extras)
+}
+
+// BridgeMessages returns the channel of incoming bridge messages.
+func (s *Session) BridgeMessages() <-chan BridgeMessage {
+	br := s.Bridge()
+	if br == nil {
+		return nil
+	}
+	return br.Messages()
 }
 
 func (s *Session) Accept(sdp string) error {
@@ -128,6 +194,13 @@ func (s *Session) LowerHand() error {
 }
 
 func (s *Session) Close() error {
+	s.bridgeMu.Lock()
+	if s.bridge != nil {
+		_ = s.bridge.Close()
+		s.bridge = nil
+	}
+	s.bridgeMu.Unlock()
+
 	if s.room != "" {
 		_ = s.Conn.LeaveMUC(s.room)
 		// give server a moment to receive it

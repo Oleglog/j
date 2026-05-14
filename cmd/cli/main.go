@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,8 +10,8 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/coder/websocket"
 	j "github.com/zarazaex69/j"
+	"github.com/zarazaex69/j/internal/colibri"
 )
 
 func main() {
@@ -21,13 +20,13 @@ func main() {
 	nick := flag.String("nick", "thejproject", "Display name")
 	debug := flag.Bool("debug", false, "Verbose XMPP logging")
 	chat := flag.Bool("chat", false, "Chat mode: join room and read stdin for messages")
-	dc := flag.Bool("dc", false, "DataChannel PoC: wait for Jingle, set up PeerConnection, send messages from stdin")
-	dcRaw := flag.Bool("dc-raw", false, "DataChannel PoC raw mode: pipe stdin as binary base64 frames, print received frames decoded to stdout")
+	dc := flag.Bool("dc", false, "Bridge channel mode: stdin → broadcast EndpointMessage as text")
+	dcRaw := flag.Bool("dc-raw", false, "Bridge channel raw mode: pipe stdin → bridge → stdout (binary, base64-framed)")
 	timeout := flag.Duration("timeout", 5*time.Minute, "Timeout waiting for Jingle session")
 	flag.Parse()
 
 	if *host == "" || *room == "" {
-		fmt.Fprintln(os.Stderr, "usage: cli -host meet.example.com -room myroom [-nick name] [-chat | -dc]")
+		fmt.Fprintln(os.Stderr, "usage: cli -host meet.example.com -room myroom [-nick name] [-chat | -dc | -dc-raw]")
 		os.Exit(1)
 	}
 
@@ -58,15 +57,7 @@ func runChat(ctx context.Context, host, room, nick string, debug bool) {
 
 	fmt.Fprintf(os.Stderr, "joined! type messages (/raise, /lower, /quit):\n")
 
-	lines := make(chan string)
-	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			lines <- scanner.Text()
-		}
-		close(lines)
-	}()
-
+	lines := readLines(ctx)
 	incoming := sess.Messages()
 
 	for {
@@ -121,6 +112,7 @@ func runJingle(ctx context.Context, host, room, nick string, debug bool, timeout
 	out := map[string]any{
 		"jid":          sess.JID,
 		"room_jid":     sess.RoomJID,
+		"colibri_ws":   sess.ColibriWS,
 		"sdp":          sess.SDP,
 		"ice_servers":  sess.ICEServers,
 		"candidates":   sess.Candidates,
@@ -134,85 +126,7 @@ func runJingle(ctx context.Context, host, room, nick string, debug bool, timeout
 	enc.Encode(out)
 }
 
-func runDCRaw(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration) {
-	jctx, jcancel := context.WithTimeout(ctx, timeout)
-	defer jcancel()
-
-	fmt.Fprintln(os.Stderr, "waiting for jingle session-initiate (needs 2nd participant in room)...")
-	sess, err := j.Join(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
-	defer sess.Close()
-
-	if sess.ColibriWS == "" {
-		fmt.Fprintln(os.Stderr, "no colibri-ws URL in jingle offer")
-		os.Exit(1)
-	}
-
-	wsConn, _, err := websocket.Dial(ctx, sess.ColibriWS, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "colibri ws dial: %v\n", err)
-		os.Exit(1)
-	}
-	defer wsConn.Close(websocket.StatusNormalClosure, "")
-
-	fmt.Fprintln(os.Stderr, "colibri-ws connected. raw mode: stdin chunks → base64 → broadcast.")
-
-	// reader: parse incoming EndpointMessage and decode b64 -> stdout
-	go func() {
-		for {
-			_, data, err := wsConn.Read(ctx)
-			if err != nil {
-				return
-			}
-			var msg map[string]any
-			if err := json.Unmarshal(data, &msg); err != nil {
-				continue
-			}
-			if msg["colibriClass"] != "EndpointMessage" {
-				continue
-			}
-			b64, ok := msg["b64"].(string)
-			if !ok {
-				continue
-			}
-			raw, err := base64.StdEncoding.DecodeString(b64)
-			if err != nil {
-				continue
-			}
-			os.Stdout.Write(raw)
-		}
-	}()
-
-	// stdin: read 4KB chunks, send each as one EndpointMessage
-	buf := make([]byte, 4096)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		n, err := os.Stdin.Read(buf)
-		if n > 0 {
-			payload := map[string]any{
-				"colibriClass": "EndpointMessage",
-				"to":           "",
-				"b64":          base64.StdEncoding.EncodeToString(buf[:n]),
-			}
-			data, _ := json.Marshal(payload)
-			if werr := wsConn.Write(ctx, websocket.MessageText, data); werr != nil {
-				fmt.Fprintf(os.Stderr, "ws send: %v\n", werr)
-				return
-			}
-		}
-		if err != nil {
-			return
-		}
-	}
-}
-
+// runDC: text broadcast over bridge channel. Each line of stdin → EndpointMessage{text:line}.
 func runDC(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration) {
 	jctx, jcancel := context.WithTimeout(ctx, timeout)
 	defer jcancel()
@@ -225,43 +139,20 @@ func runDC(ctx context.Context, host, room, nick string, debug bool, timeout tim
 	}
 	defer sess.Close()
 
-	if sess.ColibriWS == "" {
-		fmt.Fprintln(os.Stderr, "no colibri-ws URL in jingle offer (this Jitsi may not support it)")
+	if err := sess.OpenBridge(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "open bridge: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Fprintf(os.Stderr, "connecting to colibri-ws: %s\n", sess.ColibriWS)
+	fmt.Fprintln(os.Stderr, "bridge connected. type messages to broadcast, /quit to exit:")
 
-	wsConn, _, err := websocket.Dial(ctx, sess.ColibriWS, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "colibri ws dial: %v\n", err)
-		os.Exit(1)
-	}
-	defer wsConn.Close(websocket.StatusNormalClosure, "")
-
-	fmt.Fprintln(os.Stderr, "colibri-ws connected. type messages to broadcast, /quit to exit:")
-
-	// reader
 	go func() {
-		for {
-			_, data, err := wsConn.Read(ctx)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "ws read error: %v\n", err)
-				return
-			}
-			fmt.Printf("[colibri] %s\n", string(data))
+		for m := range sess.BridgeMessages() {
+			fmt.Printf("[%s/%s] %s\n", m.Class, m.From, string(m.RawJSON))
 		}
 	}()
 
-	lines := make(chan string)
-	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			lines <- scanner.Text()
-		}
-		close(lines)
-	}()
-
+	lines := readLines(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -273,18 +164,81 @@ func runDC(ctx context.Context, host, room, nick string, debug bool, timeout tim
 			if line == "/quit" || line == "/exit" {
 				return
 			}
-			payload := map[string]any{
-				"colibriClass": "EndpointMessage",
-				"to":           "", // broadcast
-				"msgPayload": map[string]any{
-					"text": line,
-				},
-			}
-			data, _ := json.Marshal(payload)
-			if err := wsConn.Write(ctx, websocket.MessageText, data); err != nil {
-				fmt.Fprintf(os.Stderr, "ws send: %v\n", err)
+			if err := sess.BridgeSendMessage("", map[string]any{"text": line}); err != nil {
+				fmt.Fprintf(os.Stderr, "send: %v\n", err)
 				return
 			}
 		}
 	}
+}
+
+// runDCRaw: pipe arbitrary binary through the bridge.
+//   stdin (binary) → SendRaw broadcast → other endpoint receives → DecodeRaw → stdout
+func runDCRaw(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration) {
+	jctx, jcancel := context.WithTimeout(ctx, timeout)
+	defer jcancel()
+
+	fmt.Fprintln(os.Stderr, "waiting for jingle session-initiate (needs 2nd participant in room)...")
+	sess, err := j.Join(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer sess.Close()
+
+	if err := sess.OpenBridge(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "open bridge: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintln(os.Stderr, "bridge connected. raw mode: stdin (bytes) ←→ bridge ←→ stdout")
+
+	// receive: decode raw frames to stdout, log other classes to stderr
+	go func() {
+		for m := range sess.BridgeMessages() {
+			if raw := colibri.DecodeRaw(m); raw != nil {
+				os.Stdout.Write(raw)
+				continue
+			}
+			if m.Class != "EndpointMessage" {
+				fmt.Fprintf(os.Stderr, "[%s] %s\n", m.Class, string(m.RawJSON))
+			}
+		}
+	}()
+
+	// send: chunked stdin
+	buf := make([]byte, 8192)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		n, err := os.Stdin.Read(buf)
+		if n > 0 {
+			if serr := sess.BridgeSendRaw("", buf[:n]); serr != nil {
+				fmt.Fprintf(os.Stderr, "send: %v\n", serr)
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func readLines(ctx context.Context) <-chan string {
+	out := make(chan string)
+	go func() {
+		defer close(out)
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			select {
+			case out <- scanner.Text():
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
 }

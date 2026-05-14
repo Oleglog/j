@@ -312,6 +312,7 @@ func writeSSRCGroups(b *strings.Builder, lines []string) {
 }
 
 func writeJingleTransport(b *strings.Builder, lines []string, sctpPort string, shared sharedTransport) {
+	rtcpMux := hasAttrFlag(lines, "rtcp-mux")
 	ufrag := getAttr(lines, "ice-ufrag")
 	if ufrag == "" {
 		ufrag = shared.ufrag
@@ -344,17 +345,24 @@ func writeJingleTransport(b *strings.Builder, lines []string, sctpPort string, s
 		}
 	}
 
-	// candidates — prefer per-section, fall back to shared
+	// candidates — prefer per-section, fall back to shared. Skip component=2 if rtcp-mux.
 	wroteCandidate := false
 	for _, line := range lines {
 		if !strings.HasPrefix(line, "a=candidate:") {
 			continue
 		}
-		writeJingleCandidate(b, strings.TrimPrefix(line, "a=candidate:"))
+		raw := strings.TrimPrefix(line, "a=candidate:")
+		if rtcpMux && candidateComponent(raw) == "2" {
+			continue
+		}
+		writeJingleCandidate(b, raw)
 		wroteCandidate = true
 	}
 	if !wroteCandidate {
 		for _, raw := range shared.candidates {
+			if rtcpMux && candidateComponent(raw) == "2" {
+				continue
+			}
 			writeJingleCandidate(b, raw)
 		}
 	}
@@ -365,6 +373,14 @@ func writeJingleTransport(b *strings.Builder, lines []string, sctpPort string, s
 	}
 
 	b.WriteString("</transport>")
+}
+
+func candidateComponent(raw string) string {
+	fs := strings.Fields(raw)
+	if len(fs) >= 2 {
+		return fs[1]
+	}
+	return ""
 }
 
 func writeJingleCandidate(b *strings.Builder, raw string) {

@@ -47,7 +47,7 @@ func runChat(ctx context.Context, host, room, nick string, debug bool) {
 	}
 	defer sess.Close()
 
-	fmt.Fprintf(os.Stderr, "joined! type messages:\n")
+	fmt.Fprintf(os.Stderr, "joined! type messages (/raise, /lower for hand):\n")
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
@@ -55,9 +55,20 @@ func runChat(ctx context.Context, host, room, nick string, debug bool) {
 		if line == "" {
 			continue
 		}
-		if err := sess.Chat(line); err != nil {
-			fmt.Fprintf(os.Stderr, "send error: %v\n", err)
-			return
+		switch line {
+		case "/raise":
+			if err := sess.RaiseHand(); err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			}
+		case "/lower":
+			if err := sess.LowerHand(); err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			}
+		default:
+			if err := sess.Chat(line); err != nil {
+				fmt.Fprintf(os.Stderr, "send error: %v\n", err)
+				return
+			}
 		}
 	}
 }

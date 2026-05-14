@@ -31,6 +31,7 @@ type Session struct {
 	AudioSSRC    []jingle.Source
 	VideoSSRC    []jingle.Source
 	Conn         *xmpp.Conn
+	room         string
 	jingleSID    string
 	initiator    string
 }
@@ -41,6 +42,14 @@ func (s *Session) Accept(sdp string) error {
 
 func (s *Session) Chat(msg string) error {
 	return s.Conn.SendGroupchat(s.RoomJID, msg)
+}
+
+func (s *Session) RaiseHand() error {
+	return s.Conn.RaiseHand(s.room)
+}
+
+func (s *Session) LowerHand() error {
+	return s.Conn.LowerHand(s.room)
 }
 
 func (s *Session) Close() error {
@@ -75,6 +84,7 @@ func JoinMUC(ctx context.Context, cfg Config) (*Session, error) {
 		JID:     conn.JID(),
 		RoomJID: fmt.Sprintf("%s@conference.%s", cfg.Room, cfg.Host),
 		Conn:    conn,
+		room:    cfg.Room,
 	}, nil
 }
 
@@ -125,6 +135,7 @@ func Join(ctx context.Context, cfg Config) (*Session, error) {
 		AudioSSRC:   parsed.AudioSources,
 		VideoSSRC:   parsed.VideoSources,
 		Conn:        conn,
+		room:        cfg.Room,
 		jingleSID:   parsed.SID,
 		initiator:   parsed.Initiator,
 	}

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -351,6 +352,17 @@ func (c *Conn) SendSessionAccept(sid, initiator, roomJID, sdp string) error {
 func (c *Conn) SendGroupchat(roomJID, body string) error {
 	msg := fmt.Sprintf(`<message to="%s" type="groupchat" xmlns="jabber:client"><body>%s</body></message>`, roomJID, xmlEscape(body))
 	return c.send(msg)
+}
+
+func (c *Conn) RaiseHand(room string) error {
+	roomJID := fmt.Sprintf("%s@conference.%s/%s", room, c.host, c.nick)
+	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+	return c.send(fmt.Sprintf(`<presence to="%s" xmlns="jabber:client"><jitsi_participant_raisedHand>%s</jitsi_participant_raisedHand></presence>`, roomJID, ts))
+}
+
+func (c *Conn) LowerHand(room string) error {
+	roomJID := fmt.Sprintf("%s@conference.%s/%s", room, c.host, c.nick)
+	return c.send(fmt.Sprintf(`<presence to="%s" xmlns="jabber:client"><jitsi_participant_raisedHand/></presence>`, roomJID))
 }
 
 func extractJID(s string) string {

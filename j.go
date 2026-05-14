@@ -9,9 +9,10 @@ import (
 )
 
 type Config struct {
-	Host string // e.g. "meet.cryptopro.ru"
-	Room string // e.g. "myroom"
-	Nick string // display name
+	Host  string // e.g. "meet.cryptopro.ru"
+	Room  string // e.g. "myroom"
+	Nick  string // display name
+	Debug bool   // verbose XMPP logging
 }
 
 type ICEServer struct {
@@ -54,7 +55,7 @@ func Join(ctx context.Context, cfg Config) (*Session, error) {
 		cfg.Nick = "j-client"
 	}
 
-	conn, err := xmpp.Dial(ctx, cfg.Host, cfg.Room)
+	conn, err := xmpp.Dial(ctx, cfg.Host, cfg.Room, cfg.Debug)
 	if err != nil {
 		return nil, fmt.Errorf("xmpp dial: %w", err)
 	}

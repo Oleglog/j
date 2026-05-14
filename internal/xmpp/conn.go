@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ type Conn struct {
 	room    string
 	jid     string
 	nick    string
+	debug   bool
 	mu      sync.Mutex
 	ackH    atomic.Int64
 	stanzas chan string
@@ -32,7 +34,7 @@ type Service struct {
 	Password  string
 }
 
-func Dial(ctx context.Context, host, room string) (*Conn, error) {
+func Dial(ctx context.Context, host, room string, debug bool) (*Conn, error) {
 	url := fmt.Sprintf("wss://%s/xmpp-websocket?room=%s", host, room)
 	ws, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
 		Subprotocols: []string{"xmpp"},
@@ -46,6 +48,7 @@ func Dial(ctx context.Context, host, room string) (*Conn, error) {
 		ws:      ws,
 		host:    host,
 		room:    room,
+		debug:   debug,
 		stanzas: make(chan string, 64),
 		closed:  make(chan struct{}),
 	}
@@ -74,6 +77,9 @@ func (c *Conn) Close() error {
 func (c *Conn) send(s string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.debug {
+		fmt.Fprintf(os.Stderr, "[xmpp] -> %s\n", s)
+	}
 	return c.ws.Write(context.Background(), websocket.MessageText, []byte(s))
 }
 
@@ -96,15 +102,25 @@ func (c *Conn) readLoop() {
 		if err != nil {
 			return
 		}
+		if c.debug {
+			fmt.Fprintf(os.Stderr, "[xmpp:loop] <- %s\n", msg)
+		}
 		// handle stream management
-		if strings.Contains(msg, "<r ") || strings.Contains(msg, "<r/>") {
+		if strings.Contains(msg, "<r ") || strings.Contains(msg, "<r/>") || strings.Contains(msg, "<r xmlns") {
 			c.send(fmt.Sprintf(`<a h="%d" xmlns="urn:xmpp:sm:3"/>`, c.ackH.Load()))
 			continue
 		}
-		if strings.Contains(msg, "<a ") {
+		if strings.HasPrefix(msg, "<a ") || strings.Contains(msg, "<a xmlns=\"urn:xmpp:sm:3\"") || strings.Contains(msg, "<a xmlns='urn:xmpp:sm:3'") {
 			continue
 		}
 		c.ackH.Add(1)
+
+		// auto-reply to disco#info queries from Jicofo
+		if strings.Contains(msg, "disco#info") && strings.Contains(msg, "type='get'") {
+			c.handleDiscoQuery(msg)
+			continue
+		}
+
 		select {
 		case c.stanzas <- msg:
 		case <-c.closed:
@@ -113,82 +129,142 @@ func (c *Conn) readLoop() {
 	}
 }
 
+func (c *Conn) handleDiscoQuery(msg string) {
+	from := extractXMLAttr(msg, "from")
+	id := extractXMLAttr(msg, "id")
+	if from == "" || id == "" {
+		return
+	}
+	resp := fmt.Sprintf(`<iq to="%s" id="%s" type="result" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:dtls-sctp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="http://jitsi.org/protocol/colibri2"/></query></iq>`, from, id)
+	c.send(resp)
+}
+
+func extractXMLAttr(s, attr string) string {
+	// try single quotes first (prosody style)
+	key := attr + "='"
+	i := strings.Index(s, key)
+	if i != -1 {
+		i += len(key)
+		end := strings.IndexByte(s[i:], '\'')
+		if end != -1 {
+			return s[i : i+end]
+		}
+	}
+	// try double quotes
+	key = attr + `="`
+	i = strings.Index(s, key)
+	if i != -1 {
+		i += len(key)
+		end := strings.IndexByte(s[i:], '"')
+		if end != -1 {
+			return s[i : i+end]
+		}
+	}
+	return ""
+}
+
 func (c *Conn) auth(ctx context.Context) error {
-	// open stream
 	open := fmt.Sprintf(`<open to="%s" version="1.0" xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>`, c.host)
+
+	// phase 1: open stream
 	if err := c.send(open); err != nil {
 		return err
 	}
-	// read features
-	if _, err := c.readOne(ctx); err != nil {
-		return err
-	}
-	if _, err := c.readOne(ctx); err != nil {
-		return err
+	// read until we get stream features (server may send open + features separately or together)
+	if err := c.readUntil(ctx, "features"); err != nil {
+		return fmt.Errorf("initial features: %w", err)
 	}
 
 	// ANONYMOUS SASL
 	if err := c.send(`<auth mechanism="ANONYMOUS" xmlns="urn:ietf:params:xml:ns:xmpp-sasl"/>`); err != nil {
 		return err
 	}
-	resp, err := c.readOne(ctx)
-	if err != nil {
-		return err
-	}
-	if !strings.Contains(resp, "<success") {
-		return fmt.Errorf("sasl failed: %s", resp)
+	if err := c.readUntil(ctx, "success"); err != nil {
+		return fmt.Errorf("sasl: %w", err)
 	}
 
-	// reopen stream
+	// phase 2: reopen stream after SASL
 	if err := c.send(open); err != nil {
 		return err
 	}
-	if _, err := c.readOne(ctx); err != nil {
-		return err
-	}
-	if _, err := c.readOne(ctx); err != nil {
-		return err
+	if err := c.readUntil(ctx, "features"); err != nil {
+		return fmt.Errorf("post-auth features: %w", err)
 	}
 
 	// bind
-	if err := c.send(`<iq type="set" id="bind_1"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"/></iq>`); err != nil {
+	if err := c.send(`<iq type="set" id="bind_1" xmlns="jabber:client"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"/></iq>`); err != nil {
 		return err
 	}
-	bindResp, err := c.readOne(ctx)
+	bindResp, err := c.readUntilReturn(ctx, "<jid>")
 	if err != nil {
-		return err
+		return fmt.Errorf("bind: %w", err)
 	}
 	c.jid = extractJID(bindResp)
 	if c.jid == "" {
 		return fmt.Errorf("bind failed: %s", bindResp)
 	}
-	// nick = first 8 chars of uuid part
 	parts := strings.Split(c.jid, "@")
 	if len(parts) > 0 && len(parts[0]) >= 8 {
 		c.nick = parts[0][:8]
 	}
 
 	// session
-	if err := c.send(`<iq type="set" id="sess_1"><session xmlns="urn:ietf:params:xml:ns:xmpp-session"/></iq>`); err != nil {
+	if err := c.send(`<iq type="set" id="sess_1" xmlns="jabber:client"><session xmlns="urn:ietf:params:xml:ns:xmpp-session"/></iq>`); err != nil {
 		return err
 	}
-	if _, err := c.readOne(ctx); err != nil {
-		return err
+	if err := c.readUntil(ctx, "sess_1"); err != nil {
+		return fmt.Errorf("session: %w", err)
 	}
 
 	// enable stream management
 	if err := c.send(`<enable resume="true" xmlns="urn:xmpp:sm:3"/>`); err != nil {
 		return err
 	}
-	if _, err := c.readOne(ctx); err != nil {
-		return err
+	if err := c.readUntil(ctx, "enabled"); err != nil {
+		return fmt.Errorf("sm enable: %w", err)
 	}
 
 	return nil
 }
 
+func (c *Conn) readUntil(ctx context.Context, substr string) error {
+	for {
+		msg, err := c.readOne(ctx)
+		if err != nil {
+			return err
+		}
+		if c.debug {
+			fmt.Fprintf(os.Stderr, "[xmpp] <- %s\n", msg)
+		}
+		if strings.Contains(msg, substr) {
+			return nil
+		}
+		if strings.Contains(msg, "stream:error") || strings.Contains(msg, "<failure") {
+			return fmt.Errorf("server error: %s", msg)
+		}
+	}
+}
+
+func (c *Conn) readUntilReturn(ctx context.Context, substr string) (string, error) {
+	for {
+		msg, err := c.readOne(ctx)
+		if err != nil {
+			return "", err
+		}
+		if c.debug {
+			fmt.Fprintf(os.Stderr, "[xmpp] <- %s\n", msg)
+		}
+		if strings.Contains(msg, substr) {
+			return msg, nil
+		}
+		if strings.Contains(msg, "stream:error") || strings.Contains(msg, "<failure") {
+			return "", fmt.Errorf("server error: %s", msg)
+		}
+	}
+}
+
 func (c *Conn) DiscoverServices() ([]Service, error) {
-	iq := fmt.Sprintf(`<iq type="get" to="%s" id="disco_1"><services xmlns="urn:xmpp:extdisco:2"/></iq>`, c.host)
+	iq := fmt.Sprintf(`<iq type="get" to="%s" id="disco_1" xmlns="jabber:client"><services xmlns="urn:xmpp:extdisco:2"/></iq>`, c.host)
 	if err := c.send(iq); err != nil {
 		return nil, err
 	}
@@ -210,7 +286,7 @@ func (c *Conn) waitServices() ([]Service, error) {
 
 func (c *Conn) AllocateFocus(room string) error {
 	roomJID := fmt.Sprintf("%s@conference.%s", room, c.host)
-	iq := fmt.Sprintf(`<iq to="focus.%s" type="set" id="focus_1"><conference room="%s" machine-uid="%s" xmlns="http://jitsi.org/protocol/focus"><property name="rtcstatsEnabled" value="false"/><property name="visitors-version" value="1"/></conference></iq>`,
+	iq := fmt.Sprintf(`<iq to="focus.%s" type="set" id="focus_1" xmlns="jabber:client"><conference room="%s" machine-uid="%s" xmlns="http://jitsi.org/protocol/focus"><property name="rtcstatsEnabled" value="false"/><property name="visitors-version" value="1"/></conference></iq>`,
 		c.host, roomJID, c.nick)
 	if err := c.send(iq); err != nil {
 		return err
@@ -233,7 +309,7 @@ func (c *Conn) AllocateFocus(room string) error {
 
 func (c *Conn) JoinMUC(room, displayName string) error {
 	roomJID := fmt.Sprintf("%s@conference.%s/%s", room, c.host, c.nick)
-	presence := fmt.Sprintf(`<presence to="%s"><x xmlns="http://jabber.org/protocol/muc"/><stats-id>%s</stats-id><c hash="sha-1" node="https://jitsi.org/jitsi-meet" ver="location" xmlns="http://jabber.org/protocol/caps"/><SourceInfo>{}</SourceInfo><jitsi_participant_codecList>vp9,vp8,h264</jitsi_participant_codecList><nick xmlns="http://jabber.org/protocol/nick">%s</nick></presence>`,
+	presence := fmt.Sprintf(`<presence to="%s" xmlns="jabber:client"><x xmlns="http://jabber.org/protocol/muc"/><stats-id>%s</stats-id><c hash="sha-1" node="https://jitsi.org/jitsi-meet" ver="location" xmlns="http://jabber.org/protocol/caps"/><SourceInfo>{}</SourceInfo><jitsi_participant_codecList>vp9,vp8,h264</jitsi_participant_codecList><nick xmlns="http://jabber.org/protocol/nick">%s</nick></presence>`,
 		roomJID, displayName[:min(3, len(displayName))]+"-j", displayName)
 	if err := c.send(presence); err != nil {
 		return err
@@ -267,14 +343,13 @@ func (c *Conn) WaitJingle(ctx context.Context) (string, error) {
 }
 
 func (c *Conn) SendSessionAccept(sid, initiator, roomJID, sdp string) error {
-	// sdp is already formatted as jingle XML by caller
-	iq := fmt.Sprintf(`<iq to="%s" type="set" id="accept_1"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" sid="%s" initiator="%s" responder="%s">%s</jingle></iq>`,
+	iq := fmt.Sprintf(`<iq to="%s" type="set" id="accept_1" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" sid="%s" initiator="%s" responder="%s">%s</jingle></iq>`,
 		roomJID+"/focus", sid, initiator, c.jid, sdp)
 	return c.send(iq)
 }
 
 func (c *Conn) SendGroupchat(roomJID, body string) error {
-	msg := fmt.Sprintf(`<message to="%s" type="groupchat"><body>%s</body></message>`, roomJID, xmlEscape(body))
+	msg := fmt.Sprintf(`<message to="%s" type="groupchat" xmlns="jabber:client"><body>%s</body></message>`, roomJID, xmlEscape(body))
 	return c.send(msg)
 }
 

@@ -5,69 +5,190 @@
 ![License](https://img.shields.io/badge/license-ZARAZAEX%20ANY%20DO-0D1117?style=flat-square&logo=open-source-initiative&logoColor=green&labelColor=0D1117)
 ![Golang](https://img.shields.io/badge/-Golang-0D1117?style=flat-square&logo=go&logoColor=00A7D0)
 
-
-
-
-
-
 </div>
 
 ## j
 
-Go-библиотека для программного подключения к Jitsi Meet звонкам. Выполняет XMPP-сигнализацию, получает Jingle session и возвращает готовые данные для подключения к DataChannel, Audio, Video и Chat через [pion/webrtc](https://github.com/pion/webrtc).
+Go-библиотека для программного подключения к Jitsi Meet звонкам. Делает XMPP-сигнализацию, заходит в MUC, ловит Jingle session-initiate, парсит SDP/ICE/SSRC, открывает bridge channel (colibri-ws) и даёт API чтобы:
+
+- сидеть в чате (groupchat сообщения, поднимать/опускать руку)
+- слать текст всем участникам через bridge channel
+- слать **сырые байты** через bridge channel (broadcast или конкретному endpoint)
+- получать всё это в обратную сторону
+- отдавать SDP/ICE/SSRC во внешний WebRTC-стек (например [pion/webrtc](https://github.com/pion/webrtc)) для медиа
 
 Создана для проекта [olcRTC](https://github.com/openlibrecommunity/olcrtc).
 
-## Возможности
+Адреса/комнаты не захардкожены — всё передаётся пользователем.
 
-- Подключение к любому Jitsi Meet серверу (адрес передаётся пользователем)
-- ANONYMOUS SASL аутентификация (гостевой вход)
-- XMPP over WebSocket сигнализация
-- Получение Jingle session-initiate (SDP, ICE candidates, DTLS fingerprint)
-- Извлечение TURN/STUN credentials
-- Отправка session-accept
-- Участие в MUC (чат, presence, SourceInfo)
-- Выдача структурированных данных для pion: SDP, ICE, DataChannel параметры
+## Что внутри
+
+```
+j/
+├── j.go                       # public API: Join, JoinMUC, Session, ICEServer, Message
+├── internal/
+│   ├── xmpp/                  # WebSocket + ANONYMOUS SASL + bind + MUC + focus + SM (XEP-0198)
+│   ├── jingle/                # Jingle session-initiate ↔ SDP конвертер (BUNDLE, RTP, RTCP-FB, SSRC)
+│   └── colibri/               # bridge channel WebSocket — JVB protocol (EndpointMessage, LastN, …)
+├── cmd/cli/                   # CLI: 4 режима (jingle, chat, dc, dc-raw)
+```
 
 ## Протокол
 
 ```
-WebSocket (wss://host/xmpp-websocket?room=ROOM, subprotocol: xmpp)
-    │
-    ├─ ANONYMOUS SASL → bind → session → Stream Management (XEP-0198)
-    ├─ extdisco:2 → TURN/STUN credentials
-    ├─ focus allocation → conference ready
-    ├─ MUC join (presence + codecList + SourceInfo + nick)
-    ├─ ← Jingle session-initiate (SDP as XML, ICE candidates)
-    ├─ → Jingle session-accept
-    └─ Chat: groupchat messages
+WebSocket wss://host/xmpp-websocket?room=ROOM   (subprotocol: xmpp)
+   │
+   ├─ ANONYMOUS SASL → bind → session → Stream Management (XEP-0198)
+   ├─ extdisco:2 → TURN/STUN credentials
+   ├─ focus.host conference allocation
+   ├─ MUC join (presence, codecList, SourceInfo, nick, caps)
+   ├─ ← Jingle session-initiate (SDP-as-XML, ICE candidates, colibri-ws URL)
+   ├─ → session-accept (опционально, для медиа)
+   ├─ groupchat / raise-hand / leave
+   │
+   └─ ─── colibri-ws (bridge channel WebSocket) ──→ JVB
+                ├─ ClientHello / ServerHello
+                ├─ EndpointMessage  (broadcast или unicast — произвольный payload)
+                ├─ EndpointStats / DominantSpeaker / LastN / …
+                └─ raw bytes via base64 в EndpointMessage
 ```
 
 ## Использование
 
 ```go
-import "github.com/zarazaex69/j"
+import (
+    "context"
+    j "github.com/zarazaex69/j"
+    "github.com/zarazaex69/j/internal/colibri"
+)
 
-session, err := j.Join(j.Config{
-    Host:     "meet.example.com",
-    Room:     "myroom",
-    Nick:     "thejproject",
+ctx := context.Background()
+sess, err := j.Join(ctx, j.Config{
+    Host: "meet.cryptopro.ru",
+    Room: "myroom",
+    Nick: "thejproject",
+})
+if err != nil { panic(err) }
+defer sess.Close()
+```
+
+`j.Join` ждёт session-initiate от Jicofo (нужен ≥1 другой участник в комнате). Если хватает только захода в чат без медиа — используй `j.JoinMUC`.
+
+### Чат / MUC
+
+```go
+sess.Chat("привет всем")
+sess.RaiseHand()
+sess.LowerHand()
+
+for m := range sess.Messages() {
+    fmt.Printf("<%s> %s\n", m.From, m.Body)
+}
+```
+
+### Bridge channel (DataChannel)
+
+В современном Jitsi классический SCTP DataChannel deprecated с 2020 — бридж раздаёт WebSocket URL в Jingle (`<web-socket url=…/>`). `j` сам его извлекает.
+
+```go
+// поднять colibri-ws к JVB
+sess.OpenBridge(ctx)
+
+// сырые байты — broadcast всем
+sess.BridgeSendRaw("", []byte{0xDE, 0xAD, 0xBE, 0xEF})
+
+// сырые байты — конкретному endpoint
+sess.BridgeSendRaw("2968719f", payload)
+
+// JSON EndpointMessage с произвольными полями (бридж не парсит, релеит как есть)
+sess.BridgeSendMessage("", map[string]any{
+    "type": "chat",
+    "text": "hi",
 })
 
-// session.SDP        — remote SDP offer
-// session.ICE        — ICE candidates + TURN/STUN creds
-// session.DataChannel — DataChannel parameters
-// session.Offer()    — send session-accept
-// session.Chat("msg") — send groupchat message
+// приём
+for m := range sess.BridgeMessages() {
+    switch m.Class {
+    case "EndpointMessage":
+        if raw := colibri.DecodeRaw(m); raw != nil {
+            // получили сырые байты от собеседника
+        } else {
+            // m.Fields содержит весь JSON
+        }
+    case "DominantSpeakerMessage":
+        // m.Fields["dominantSpeakerEndpoint"]
+    }
+}
+```
+
+### Низкоуровневый bridge API
+
+```go
+br := sess.Bridge()
+br.SendLastN(8)
+br.SendVideoType("camera")        // "camera" | "desktop" | "none"
+br.SendSourceVideoType("alice-v0", "desktop")
+br.SendEndpointStats(map[string]any{"bitrate": 1234, "jvbRTT": 12})
+br.SendReceiverAudioSubscription("Include", []string{"alice-a0"})
+br.SendReceiverVideoConstraints(map[string]any{ /* … */ })
+br.SendJSON(anyJSONserialisable)
+```
+
+### WebRTC данные для pion
+
+```go
+sess.SDP          // remote SDP (offer от Jicofo)
+sess.ICEServers   // STUN/TURN с расширенными creds (extdisco:2)
+sess.Candidates   // ICE candidates
+sess.AudioSSRC    // SSRC аудио
+sess.VideoSSRC    // SSRC видео
+sess.DataChannel  // SCTP DC параметры (если бридж его прислал)
+sess.ColibriWS    // bridge WS URL
 ```
 
 ## CLI
 
 ```sh
-go run ./cmd/cli -host meet.example.com -room myroom -nick thejproject
+# просто получить SDP/ICE/SSRC и выйти
+go run ./cmd/cli -host meet.example.com -room myroom
+
+# чат: stdin → groupchat, /raise, /lower, /quit
+go run ./cmd/cli -host meet.example.com -room myroom -nick thejproject -chat
+
+# bridge channel: stdin (текст) → broadcast EndpointMessage
+go run ./cmd/cli -host meet.example.com -room myroom -nick thejproject -dc
+
+# bridge channel raw: pipe сырых байт между двумя CLI через JVB
+go run ./cmd/cli -host meet.example.com -room myroom -nick alice -dc-raw <input.bin
+go run ./cmd/cli -host meet.example.com -room myroom -nick bob   -dc-raw >output.bin
+
+# флаги
+-host           Jitsi-сервер (например meet.example.com)
+-room           имя комнаты
+-nick           отображаемое имя (по умолчанию thejproject)
+-debug          подробный лог XMPP/WS
+-timeout 5m    сколько ждать Jingle session-initiate
+-chat | -dc | -dc-raw   режим (по умолчанию — режим Jingle: вывести данные сессии)
 ```
 
-Подключается к звонку с указанным именем и выводит данные сессии.
+## Зависимости
+
+- Go 1.21+
+- `github.com/coder/websocket`
+
+## Сборка
+
+```sh
+git clone https://github.com/zarazaex69/j
+cd j
+go build ./...
+```
+
+## Что дальше
+
+- session-accept с реальным SDP-ответом от pion (для приёма медиа)
+- transport-info / source-add / source-remove обработка
+- авто-переподключение при разрыве WebSocket
 
 <div align="center">
 

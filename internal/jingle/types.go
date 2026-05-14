@@ -94,6 +94,12 @@ type XMLTransport struct {
 	Candidates  []XMLCandidate   `xml:"candidate"`
 	Fingerprint *XMLFingerprint  `xml:"fingerprint"`
 	SCTPMap     *XMLSCTPMap      `xml:"sctpmap"`
+	WebSockets  []XMLWebSocket   `xml:"web-socket"`
+}
+
+type XMLWebSocket struct {
+	XMLNS string `xml:"xmlns,attr"`
+	URL   string `xml:"url,attr"`
 }
 
 type XMLCandidate struct {

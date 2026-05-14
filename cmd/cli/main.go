@@ -10,9 +10,8 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/pion/webrtc/v4"
+	"github.com/coder/websocket"
 	j "github.com/zarazaex69/j"
-	"github.com/zarazaex69/j/internal/jingle"
 )
 
 func main() {
@@ -143,92 +142,33 @@ func runDC(ctx context.Context, host, room, nick string, debug bool, timeout tim
 	}
 	defer sess.Close()
 
-	if sess.DataChannel == nil {
-		fmt.Fprintln(os.Stderr, "no data channel in jingle offer")
+	if sess.ColibriWS == "" {
+		fmt.Fprintln(os.Stderr, "no colibri-ws URL in jingle offer (this Jitsi may not support it)")
 		os.Exit(1)
 	}
 
-	fmt.Fprintln(os.Stderr, "got jingle offer, building peer connection...")
+	fmt.Fprintf(os.Stderr, "connecting to colibri-ws: %s\n", sess.ColibriWS)
 
-	// build pion ICE config
-	var iceServers []webrtc.ICEServer
-	for _, s := range sess.ICEServers {
-		iceServers = append(iceServers, webrtc.ICEServer{
-			URLs:       s.URLs,
-			Username:   s.Username,
-			Credential: s.Credential,
-		})
-	}
-
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: iceServers})
+	wsConn, _, err := websocket.Dial(ctx, sess.ColibriWS, nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "new peer connection: %v\n", err)
+		fmt.Fprintf(os.Stderr, "colibri ws dial: %v\n", err)
 		os.Exit(1)
 	}
-	defer pc.Close()
+	defer wsConn.Close(websocket.StatusNormalClosure, "")
 
-	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		fmt.Fprintf(os.Stderr, "ICE state: %s\n", state)
-	})
-	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		fmt.Fprintf(os.Stderr, "PC state: %s\n", state)
-	})
+	fmt.Fprintln(os.Stderr, "colibri-ws connected. type messages to broadcast, /quit to exit:")
 
-	// open datachannel
-	dc, err := pc.CreateDataChannel("j-poc", nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "create dc: %v\n", err)
-		os.Exit(1)
-	}
-	dc.OnOpen(func() {
-		fmt.Fprintln(os.Stderr, "DataChannel open!")
-	})
-	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if msg.IsString {
-			fmt.Printf("[dc] %s\n", string(msg.Data))
-		} else {
-			fmt.Printf("[dc binary] %d bytes\n", len(msg.Data))
+	// reader
+	go func() {
+		for {
+			_, data, err := wsConn.Read(ctx)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ws read error: %v\n", err)
+				return
+			}
+			fmt.Printf("[colibri] %s\n", string(data))
 		}
-	})
-	dc.OnClose(func() {
-		fmt.Fprintln(os.Stderr, "DataChannel closed")
-	})
-
-	// set the remote jingle SDP as offer
-	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
-		Type: webrtc.SDPTypeOffer,
-		SDP:  sess.SDP,
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "set remote desc: %v\n", err)
-		fmt.Fprintln(os.Stderr, "--- offer SDP ---")
-		fmt.Fprintln(os.Stderr, sess.SDP)
-		os.Exit(1)
-	}
-
-	// create answer
-	answer, err := pc.CreateAnswer(nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "create answer: %v\n", err)
-		os.Exit(1)
-	}
-	if err := pc.SetLocalDescription(answer); err != nil {
-		fmt.Fprintf(os.Stderr, "set local desc: %v\n", err)
-		os.Exit(1)
-	}
-
-	// wait for ICE gathering
-	<-webrtc.GatheringCompletePromise(pc)
-
-	finalAnswer := pc.LocalDescription().SDP
-
-	// send session-accept back through XMPP (raw SDP wrapped)
-	jingleAccept := sdpToJingleAccept(finalAnswer)
-	if err := sess.Accept(jingleAccept); err != nil {
-		fmt.Fprintf(os.Stderr, "send accept: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Fprintln(os.Stderr, "session-accept sent. type messages, /quit to exit:")
+	}()
 
 	lines := make(chan string)
 	go func() {
@@ -242,7 +182,6 @@ func runDC(ctx context.Context, host, room, nick string, debug bool, timeout tim
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Fprintln(os.Stderr, "\nbye")
 			return
 		case line, ok := <-lines:
 			if !ok {
@@ -251,18 +190,18 @@ func runDC(ctx context.Context, host, room, nick string, debug bool, timeout tim
 			if line == "/quit" || line == "/exit" {
 				return
 			}
-			if dc.ReadyState() != webrtc.DataChannelStateOpen {
-				fmt.Fprintf(os.Stderr, "dc not open yet (state=%s)\n", dc.ReadyState())
-				continue
+			payload := map[string]any{
+				"colibriClass": "EndpointMessage",
+				"to":           "", // broadcast
+				"msgPayload": map[string]any{
+					"text": line,
+				},
 			}
-			if err := dc.SendText(line); err != nil {
-				fmt.Fprintf(os.Stderr, "dc send: %v\n", err)
+			data, _ := json.Marshal(payload)
+			if err := wsConn.Write(ctx, websocket.MessageText, data); err != nil {
+				fmt.Fprintf(os.Stderr, "ws send: %v\n", err)
+				return
 			}
 		}
 	}
-}
-
-// sdpToJingleAccept converts pion answer SDP to Jingle XML body.
-func sdpToJingleAccept(sdp string) string {
-	return jingle.SDPToJingleAccept(sdp)
 }

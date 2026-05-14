@@ -104,6 +104,7 @@ type Session struct {
 	DataChannel  *jingle.DataChannel
 	AudioSSRC    []jingle.Source
 	VideoSSRC    []jingle.Source
+	ColibriWS    string // bridge WebSocket URL — use for sending EndpointMessage to other participants
 	Conn         *xmpp.Conn
 	room         string
 	jingleSID    string
@@ -213,6 +214,7 @@ func Join(ctx context.Context, cfg Config) (*Session, error) {
 		DataChannel: parsed.DataChannel,
 		AudioSSRC:   parsed.AudioSources,
 		VideoSSRC:   parsed.VideoSources,
+		ColibriWS:   parsed.ColibriWS,
 		Conn:        conn,
 		room:        cfg.Room,
 		jingleSID:   parsed.SID,

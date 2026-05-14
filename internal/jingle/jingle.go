@@ -38,6 +38,7 @@ type Parsed struct {
 	AudioSources []Source
 	VideoSources []Source
 	DataChannel  *DataChannel
+	ColibriWS    string // bridge WebSocket URL (modern Jitsi data channel)
 }
 
 func Parse(raw string) *Parsed {
@@ -55,6 +56,14 @@ func Parse(raw string) *Parsed {
 
 	for _, content := range jng.Contents {
 		if content.Transport != nil {
+			if p.ColibriWS == "" {
+				for _, ws := range content.Transport.WebSockets {
+					if ws.URL != "" {
+						p.ColibriWS = ws.URL
+						break
+					}
+				}
+			}
 			for _, c := range content.Transport.Candidates {
 				p.Candidates = append(p.Candidates, Candidate{
 					Component:  c.Component,

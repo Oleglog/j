@@ -404,18 +404,14 @@ func runBench(ctx context.Context, host, room, nick string, debug bool, timeout 
 		payload[i] = byte(i & 0xFF)
 	}
 
+	// fast-path: read raw WS frames, no JSON parse / base64 decode
+	sess.Bridge().EnableRawMode()
+
 	var rxBytes uint64
 	var rxMsgs uint64
 	go func() {
-		for m := range sess.BridgeMessages() {
-			if m.Class != "EndpointMessage" {
-				continue
-			}
-			raw := colibri.DecodeRaw(m)
-			if raw == nil {
-				continue
-			}
-			rxBytes += uint64(len(raw))
+		for frame := range sess.Bridge().RawFrames() {
+			rxBytes += uint64(len(frame))
 			rxMsgs++
 		}
 	}()

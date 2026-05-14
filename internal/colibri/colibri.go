@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/coder/websocket"
 )
@@ -27,6 +28,8 @@ type Conn struct {
 	ws        *websocket.Conn
 	url       string
 	incoming  chan Message
+	rawIn     chan []byte // raw WS frame bytes — fast path for high-throughput consumers
+	rawEnable atomic.Bool
 	outgoing  chan []byte
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -56,6 +59,7 @@ func Dial(ctx context.Context, url string) (*Conn, error) {
 		ws:       ws,
 		url:      url,
 		incoming: make(chan Message, 64),
+		rawIn:    make(chan []byte, 256),
 		outgoing: make(chan []byte, defaultSendQueue),
 		closed:   make(chan struct{}),
 	}
@@ -113,6 +117,18 @@ func (c *Conn) readLoop() {
 		if err != nil {
 			return
 		}
+		// raw fast-path: skip JSON parsing entirely
+		if c.rawEnable.Load() {
+			cp := append([]byte(nil), data...)
+			select {
+			case c.rawIn <- cp:
+			case <-c.closed:
+				return
+			default:
+				// drop on overflow — caller is too slow
+			}
+			continue
+		}
 		var fields map[string]any
 		if err := json.Unmarshal(data, &fields); err != nil {
 			continue
@@ -134,6 +150,20 @@ func (c *Conn) readLoop() {
 		}
 	}
 }
+
+// EnableRawMode switches the read path into raw-frame mode: incoming WS frames
+// are forwarded as []byte to RawFrames() and not parsed. This is significantly
+// faster for high-throughput data plane use.
+//
+// Once enabled, Messages() will receive nothing more.
+func (c *Conn) EnableRawMode() {
+	c.rawEnable.Store(true)
+}
+
+// RawFrames returns the channel of raw WS frames (only populated after EnableRawMode).
+// Each frame is the raw JSON bytes — caller can extract custom fields with their own
+// fast parser, or just count bytes for benchmarks.
+func (c *Conn) RawFrames() <-chan []byte { return c.rawIn }
 
 // SendJSON serialises and sends an arbitrary JSON message. Caller is responsible for setting
 // "colibriClass".

@@ -47,6 +47,37 @@ func (s *Session) Close() error {
 	return s.Conn.Close()
 }
 
+// JoinMUC connects to the room without waiting for Jingle session.
+func JoinMUC(ctx context.Context, cfg Config) (*Session, error) {
+	if cfg.Host == "" || cfg.Room == "" {
+		return nil, fmt.Errorf("host and room are required")
+	}
+	if cfg.Nick == "" {
+		cfg.Nick = "j-client"
+	}
+
+	conn, err := xmpp.Dial(ctx, cfg.Host, cfg.Room, cfg.Debug)
+	if err != nil {
+		return nil, fmt.Errorf("xmpp dial: %w", err)
+	}
+
+	if err := conn.AllocateFocus(cfg.Room); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("allocate focus: %w", err)
+	}
+
+	if err := conn.JoinMUC(cfg.Room, cfg.Nick); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("join muc: %w", err)
+	}
+
+	return &Session{
+		JID:     conn.JID(),
+		RoomJID: fmt.Sprintf("%s@conference.%s", cfg.Room, cfg.Host),
+		Conn:    conn,
+	}, nil
+}
+
 func Join(ctx context.Context, cfg Config) (*Session, error) {
 	if cfg.Host == "" || cfg.Room == "" {
 		return nil, fmt.Errorf("host and room are required")

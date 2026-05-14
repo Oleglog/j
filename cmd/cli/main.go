@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -27,6 +28,7 @@ func main() {
 	media := flag.Bool("media", false, "Media mode: setup pion PeerConnection, send session-accept, print track events")
 	sendVideo := flag.Bool("send-video", false, "(media mode) attach a sendonly VP8 track and announce it to Jicofo")
 	bench := flag.Bool("bench", false, "Throughput benchmark: open colibri-ws, broadcast EndpointMessage at max rate, print Mbps")
+	benchXMPP := flag.Bool("bench-xmpp", false, "Throughput benchmark via XMPP groupchat (path goes through Prosody, NOT through JVB)")
 	benchSize := flag.Int("bench-size", 8192, "(bench) payload size per message in bytes")
 	benchSecs := flag.Int("bench-secs", 30, "(bench) duration of the benchmark in seconds")
 	timeout := flag.Duration("timeout", 5*time.Minute, "Timeout waiting for Jingle session")
@@ -43,6 +45,8 @@ func main() {
 	fmt.Fprintf(os.Stderr, "joining %s/%s as %s...\n", *host, *room, *nick)
 
 	switch {
+	case *benchXMPP:
+		runBenchXMPP(ctx, *host, *room, *nick, *debug, *benchSize, *benchSecs)
 	case *bench:
 		runBench(ctx, *host, *room, *nick, *debug, *timeout, *benchSize, *benchSecs)
 	case *media:
@@ -455,6 +459,110 @@ func runBench(ctx context.Context, host, room, nick string, debug bool, timeout 
 	dt := time.Since(t0).Seconds()
 
 	fmt.Fprintf(os.Stderr, "\n=== bench results ===\n")
+	fmt.Fprintf(os.Stderr, "duration:    %.2fs\n", dt)
+	fmt.Fprintf(os.Stderr, "tx:          %d msgs, %.2f MB, %.2f Mbit/s, %.0f msg/s\n",
+		txMsgs, float64(txBytes)/1e6, float64(txBytes)*8/dt/1e6, float64(txMsgs)/dt)
+	fmt.Fprintf(os.Stderr, "rx (echoed): %d msgs, %.2f MB\n", rxMsgs, float64(rxBytes)/1e6)
+}
+
+// runBenchXMPP measures throughput of XMPP groupchat through Prosody (NOT through JVB).
+// Path: client → wss://host/xmpp-websocket → prosody → other clients in MUC.
+// Each message is a <message type="groupchat"><body>BASE64</body></message> stanza.
+// Stanza size limit on cryptopro Prosody = 256 KB.
+func runBenchXMPP(ctx context.Context, host, room, nick string, debug bool, payloadSize, secs int) {
+	fmt.Fprintln(os.Stderr, "joining MUC (XMPP-only, no Jingle)...")
+	sess, err := j.JoinMUC(ctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer sess.Close()
+
+	fmt.Fprintf(os.Stderr, "bench-xmpp: payload=%dB duration=%ds\n", payloadSize, secs)
+
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i & 0xFF)
+	}
+	// pre-encode payload to base64 (we'll fake-vary the body)
+	body := base64.StdEncoding.EncodeToString(payload)
+	roomJID := sess.RoomJID
+	// direct-chat target: MUC occupant JID. We pick the first other endpoint.
+	// For groupchat use roomJID directly with type="groupchat".
+	var target string
+	for _, ep := range sess.Endpoints() {
+		target = roomJID + "/" + ep
+		break
+	}
+	if target == "" {
+		fmt.Fprintln(os.Stderr, "no other endpoint in room — falling back to groupchat broadcast")
+		target = roomJID
+	}
+
+	// rx counter via Messages channel — we get all groupchat messages,
+	// payload size approximated by body length / b64 ratio
+	var rxBytes uint64
+	var rxMsgs uint64
+	go func() {
+		for m := range sess.Messages() {
+			rxMsgs++
+			// Body is base64; original size ≈ len(body)*3/4
+			rxBytes += uint64(len(m.Body) * 3 / 4)
+		}
+	}()
+
+	// stats ticker
+	tickStop := make(chan struct{})
+	go func() {
+		var lastBytes, lastMsgs uint64
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-tickStop:
+				return
+			case <-t.C:
+				bps := float64(rxBytes-lastBytes) * 8 / 2.0
+				mps := rxMsgs - lastMsgs
+				lastBytes = rxBytes
+				lastMsgs = rxMsgs
+				fmt.Fprintf(os.Stderr, "[xmpp] rx %.2f Mbit/s, %d msg/s (total: %d msgs, %.2f MB)\n",
+					bps/1e6, mps/2, rxMsgs, float64(rxBytes)/1e6)
+			}
+		}
+	}()
+
+	// sender — raw stanza via Conn.Send to skip xmlEscape on hot path
+	xc := sess.LowLevel()
+	deadline := time.Now().Add(time.Duration(secs) * time.Second)
+	var txBytes uint64
+	var txMsgs uint64
+	t0 := time.Now()
+	if payloadSize > 0 {
+		msgType := "chat"
+		if target == roomJID {
+			msgType = "groupchat"
+		}
+		for time.Now().Before(deadline) {
+			stanza := `<message to="` + target + `" type="` + msgType + `" xmlns="jabber:client"><body>` + body + `</body></message>`
+			if err := xc.Send(stanza); err != nil {
+				fmt.Fprintf(os.Stderr, "send err: %v\n", err)
+				break
+			}
+			txBytes += uint64(payloadSize)
+			txMsgs++
+		}
+	} else {
+		// recv-only: just sleep until deadline
+		select {
+		case <-time.After(time.Until(deadline)):
+		case <-ctx.Done():
+		}
+	}
+	close(tickStop)
+	dt := time.Since(t0).Seconds()
+
+	fmt.Fprintf(os.Stderr, "\n=== bench-xmpp results ===\n")
 	fmt.Fprintf(os.Stderr, "duration:    %.2fs\n", dt)
 	fmt.Fprintf(os.Stderr, "tx:          %d msgs, %.2f MB, %.2f Mbit/s, %.0f msg/s\n",
 		txMsgs, float64(txBytes)/1e6, float64(txBytes)*8/dt/1e6, float64(txMsgs)/dt)

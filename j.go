@@ -40,7 +40,8 @@ func (s *Session) Messages() <-chan Message {
 	go func() {
 		defer close(out)
 		for stanza := range s.Conn.Stanzas() {
-			if !strings.Contains(stanza, "type='groupchat'") && !strings.Contains(stanza, `type="groupchat"`) {
+			if !strings.Contains(stanza, "type='groupchat'") && !strings.Contains(stanza, `type="groupchat"`) &&
+				!strings.Contains(stanza, "type='chat'") && !strings.Contains(stanza, `type="chat"`) {
 				continue
 			}
 			body := extractTagText(stanza, "body")

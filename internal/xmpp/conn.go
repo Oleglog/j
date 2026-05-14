@@ -25,6 +25,8 @@ type Conn struct {
 	idSeq     atomic.Int64
 	lastJngMu sync.Mutex
 	lastJng   string
+	occMu     sync.Mutex
+	occupants map[string]struct{} // MUC nick → present (excluding self and "focus")
 	stanzas   chan string
 	closed    chan struct{}
 }
@@ -49,12 +51,13 @@ func Dial(ctx context.Context, host, room string, debug bool) (*Conn, error) {
 	ws.SetReadLimit(1 << 20)
 
 	c := &Conn{
-		ws:      ws,
-		host:    host,
-		room:    room,
-		debug:   debug,
-		stanzas: make(chan string, 64),
-		closed:  make(chan struct{}),
+		ws:        ws,
+		host:      host,
+		room:      room,
+		debug:     debug,
+		occupants: make(map[string]struct{}),
+		stanzas:   make(chan string, 64),
+		closed:    make(chan struct{}),
 	}
 
 	if err := c.auth(ctx); err != nil {
@@ -133,6 +136,11 @@ func (c *Conn) readLoop() {
 		}
 		c.ackH.Add(1)
 
+		// track MUC occupants from <presence> stanzas
+		if strings.HasPrefix(msg, "<presence") || strings.HasPrefix(msg, "<presence ") {
+			c.trackPresence(msg)
+		}
+
 		// auto-reply to disco#info queries from Jicofo
 		if strings.Contains(msg, "disco#info") && strings.Contains(msg, "type='get'") {
 			c.handleDiscoQuery(msg)
@@ -145,6 +153,48 @@ func (c *Conn) readLoop() {
 			return
 		}
 	}
+}
+
+// trackPresence updates the occupants map from a <presence> stanza.
+// Available → add, type="unavailable" → remove. Skips self and "focus".
+func (c *Conn) trackPresence(msg string) {
+	from := extractXMLAttr(msg, "from")
+	if from == "" {
+		return
+	}
+	// from = "room@conference.host/<nick>"
+	slash := strings.LastIndex(from, "/")
+	if slash < 0 {
+		return
+	}
+	nick := from[slash+1:]
+	if nick == "" || nick == "focus" || nick == c.nick {
+		return
+	}
+	// also skip if not from our MUC room
+	if !strings.HasPrefix(from, c.room+"@") {
+		return
+	}
+
+	c.occMu.Lock()
+	defer c.occMu.Unlock()
+	if strings.Contains(msg, `type='unavailable'`) || strings.Contains(msg, `type="unavailable"`) {
+		delete(c.occupants, nick)
+	} else {
+		c.occupants[nick] = struct{}{}
+	}
+}
+
+// Occupants returns the list of MUC nicks (other participants) currently in the room.
+// "focus" and self are excluded. Order is unspecified.
+func (c *Conn) Occupants() []string {
+	c.occMu.Lock()
+	defer c.occMu.Unlock()
+	out := make([]string, 0, len(c.occupants))
+	for n := range c.occupants {
+		out = append(out, n)
+	}
+	return out
 }
 
 func (c *Conn) handleDiscoQuery(msg string) {

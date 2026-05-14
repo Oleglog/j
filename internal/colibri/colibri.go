@@ -19,14 +19,20 @@ import (
 )
 
 // Conn wraps the colibri-ws connection to a JVB.
+//
+// Sends are buffered through an outgoing queue with a single writer goroutine.
+// Use SendQueueDepth / CanSend / SendQueueCap for backpressure-aware code, and
+// TrySendJSON / TrySendRaw for non-blocking sends that drop on overflow.
 type Conn struct {
-	ws       *websocket.Conn
-	url      string
-	mu       sync.Mutex
-	incoming chan Message
-	closed   chan struct{}
+	ws        *websocket.Conn
+	url       string
+	incoming  chan Message
+	outgoing  chan []byte
+	closed    chan struct{}
 	closeOnce sync.Once
 }
+
+const defaultSendQueue = 1024
 
 // Message is any incoming bridge channel message. RawJSON is the original JSON, Class is the
 // colibriClass attribute, Fields holds parsed top-level JSON fields (so callers can read e.g.
@@ -50,8 +56,10 @@ func Dial(ctx context.Context, url string) (*Conn, error) {
 		ws:       ws,
 		url:      url,
 		incoming: make(chan Message, 64),
+		outgoing: make(chan []byte, defaultSendQueue),
 		closed:   make(chan struct{}),
 	}
+	go c.writeLoop()
 	// send ClientHello as required by the protocol
 	if err := c.SendJSON(map[string]any{"colibriClass": "ClientHello"}); err != nil {
 		ws.Close(websocket.StatusInternalError, "")
@@ -60,6 +68,31 @@ func Dial(ctx context.Context, url string) (*Conn, error) {
 	go c.readLoop()
 	return c, nil
 }
+
+func (c *Conn) writeLoop() {
+	for {
+		select {
+		case <-c.closed:
+			return
+		case data, ok := <-c.outgoing:
+			if !ok {
+				return
+			}
+			if err := c.ws.Write(context.Background(), websocket.MessageText, data); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// SendQueueDepth returns the number of messages currently queued for sending.
+func (c *Conn) SendQueueDepth() int { return len(c.outgoing) }
+
+// SendQueueCap returns the queue capacity.
+func (c *Conn) SendQueueCap() int { return cap(c.outgoing) }
+
+// CanSend reports whether the queue has free room (TrySend won't drop).
+func (c *Conn) CanSend() bool { return len(c.outgoing) < cap(c.outgoing) }
 
 // URL returns the WebSocket URL used for this connection.
 func (c *Conn) URL() string { return c.url }
@@ -113,9 +146,47 @@ func (c *Conn) SendJSON(payload any) error {
 }
 
 func (c *Conn) sendBytes(data []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.ws.Write(context.Background(), websocket.MessageText, data)
+	select {
+	case c.outgoing <- data:
+		return nil
+	case <-c.closed:
+		return fmt.Errorf("connection closed")
+	}
+}
+
+// trySendBytes is non-blocking: returns ErrQueueFull if the outgoing queue has no room.
+func (c *Conn) trySendBytes(data []byte) error {
+	select {
+	case c.outgoing <- data:
+		return nil
+	case <-c.closed:
+		return fmt.Errorf("connection closed")
+	default:
+		return ErrQueueFull
+	}
+}
+
+// ErrQueueFull is returned by TrySend* when the outgoing queue is full.
+var ErrQueueFull = fmt.Errorf("colibri: send queue full")
+
+// TrySendJSON is the non-blocking variant of SendJSON: drops the message and
+// returns ErrQueueFull instead of waiting for room in the outgoing queue.
+func (c *Conn) TrySendJSON(payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return c.trySendBytes(data)
+}
+
+// TrySendRaw is the non-blocking variant of SendRaw.
+func (c *Conn) TrySendRaw(to string, payload []byte) error {
+	msg := map[string]any{
+		"colibriClass": "EndpointMessage",
+		"to":           to,
+		"raw":          base64.StdEncoding.EncodeToString(payload),
+	}
+	return c.TrySendJSON(msg)
 }
 
 // SendRaw sends arbitrary opaque bytes as a single broadcast EndpointMessage. The bytes are

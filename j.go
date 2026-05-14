@@ -179,6 +179,35 @@ func (s *Session) BridgeMessages() <-chan BridgeMessage {
 	return br.Messages()
 }
 
+// BridgeTrySendRaw is the non-blocking variant of BridgeSendRaw.
+// Returns colibri.ErrQueueFull when the outgoing queue has no room — caller
+// can drop, retry or apply own backpressure policy.
+func (s *Session) BridgeTrySendRaw(to string, data []byte) error {
+	br := s.Bridge()
+	if br == nil {
+		return fmt.Errorf("bridge not open; call OpenBridge first")
+	}
+	return br.TrySendRaw(to, data)
+}
+
+// BridgeSendQueueDepth returns how many outgoing bridge messages are waiting to be sent.
+func (s *Session) BridgeSendQueueDepth() int {
+	br := s.Bridge()
+	if br == nil {
+		return 0
+	}
+	return br.SendQueueDepth()
+}
+
+// BridgeCanSend reports whether the bridge outgoing queue has free room.
+func (s *Session) BridgeCanSend() bool {
+	br := s.Bridge()
+	if br == nil {
+		return false
+	}
+	return br.CanSend()
+}
+
 // Negotiator returns a *peer.Negotiator wired to this session for use with a pion
 // PeerConnection. Caller sets pc.PC and pc.OnRemote, then calls pc.Accept(ctx) to
 // perform SDP negotiation and send session-accept to Jicofo.
@@ -208,6 +237,28 @@ func (s *Session) Negotiator() *peer.Negotiator {
 //	}
 func (s *Session) WaitJingleReinitiate(ctx context.Context) (string, error) {
 	return s.Conn.WaitJingle(ctx)
+}
+
+// OnReinitiate is the asynchronous version of WaitJingleReinitiate.
+// Spawns a goroutine that calls cb(rawStanza) on each new session-initiate.
+// Stops when ctx is cancelled or the session is closed.
+func (s *Session) OnReinitiate(ctx context.Context, cb func(stanza string)) {
+	go func() {
+		for {
+			stanza, err := s.Conn.WaitJingle(ctx)
+			if err != nil {
+				return
+			}
+			cb(stanza)
+		}
+	}()
+}
+
+// Endpoints returns the list of other participants currently in the MUC room
+// (their MUC nicks — typically first 8 chars of UUID). "focus" and self excluded.
+// Useful for client-id-style unicast routing via BridgeSendRaw.
+func (s *Session) Endpoints() []string {
+	return s.Conn.Occupants()
 }
 
 // LowLevel returns the underlying XMPP connection so callers can issue raw XMPP/Jingle stanzas.

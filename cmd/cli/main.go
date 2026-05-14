@@ -10,8 +10,9 @@ import (
 	"os/signal"
 	"time"
 
-	j "github.com/zarazaex69/j"
 	"github.com/pion/webrtc/v4"
+	j "github.com/zarazaex69/j"
+	"github.com/zarazaex69/j/internal/jingle"
 )
 
 func main() {
@@ -261,9 +262,7 @@ func runDC(ctx context.Context, host, room, nick string, debug bool, timeout tim
 	}
 }
 
-// sdpToJingleAccept is a placeholder — real Jitsi expects Jingle XML with
-// content/description elements, not raw SDP. This PoC just dumps the SDP
-// for now; full conversion needs an SDP→Jingle translator.
+// sdpToJingleAccept converts pion answer SDP to Jingle XML body.
 func sdpToJingleAccept(sdp string) string {
-	return ""
+	return jingle.SDPToJingleAccept(sdp)
 }

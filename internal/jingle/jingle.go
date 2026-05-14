@@ -1,7 +1,6 @@
 package jingle
 
 import (
-	"encoding/xml"
 	"strings"
 )
 
@@ -44,149 +43,82 @@ type Parsed struct {
 func Parse(raw string) *Parsed {
 	p := &Parsed{}
 
-	// extract sid and initiator from jingle element
 	p.SID = extractAttr(raw, "sid")
 	p.Initiator = extractAttr(raw, "initiator")
 
-	// parse XML structure
-	type xmlCandidate struct {
-		Component  string `xml:"component,attr"`
-		Foundation string `xml:"foundation,attr"`
-		Generation string `xml:"generation,attr"`
-		ID         string `xml:"id,attr"`
-		IP         string `xml:"ip,attr"`
-		Port       string `xml:"port,attr"`
-		Priority   string `xml:"priority,attr"`
-		Protocol   string `xml:"protocol,attr"`
-		Type       string `xml:"type,attr"`
-		RelAddr    string `xml:"rel-addr,attr"`
-		RelPort    string `xml:"rel-port,attr"`
+	jng, err := ParseStanza(raw)
+	if err != nil || jng == nil {
+		return p
 	}
-	type xmlFingerprint struct {
-		Hash    string `xml:"hash,attr"`
-		Setup   string `xml:"setup,attr"`
-		Content string `xml:",chardata"`
-	}
-	type xmlTransport struct {
-		Ufrag       string           `xml:"ufrag,attr"`
-		Pwd         string           `xml:"pwd,attr"`
-		Candidates  []xmlCandidate   `xml:"candidate"`
-		Fingerprint []xmlFingerprint `xml:"fingerprint"`
-	}
-	type xmlSource struct {
-		SSRC   string `xml:"ssrc,attr"`
-		Params []struct {
-			Name  string `xml:"name,attr"`
-			Value string `xml:"value,attr"`
-		} `xml:"parameter"`
-	}
-	type xmlDescription struct {
-		Media   string      `xml:"media,attr"`
-		Sources []xmlSource `xml:"source"`
-	}
-	type xmlSCTP struct {
-		Port     string `xml:"port,attr"`
-		Protocol string `xml:"protocol,attr"`
-	}
-	type xmlContent struct {
-		Name        string           `xml:"name,attr"`
-		Description xmlDescription   `xml:"description"`
-		Transport   xmlTransport     `xml:"transport"`
-		SCTP        []xmlSCTP        `xml:"transport>sctpmap"`
-	}
-	type xmlJingle struct {
-		Contents []xmlContent `xml:"content"`
-	}
-	type xmlIQ struct {
-		Jingle xmlJingle `xml:"jingle"`
-	}
+	p.Jingle = jng
+	p.SDP = JingleToSDP(jng)
 
-	var iq xmlIQ
-	xml.Unmarshal([]byte(raw), &iq)
-
-	var sdpLines []string
-	sdpLines = append(sdpLines, "v=0", "o=- 0 0 IN IP4 0.0.0.0", "s=-", "t=0 0")
-
-	for _, content := range iq.Jingle.Contents {
-		for _, c := range content.Transport.Candidates {
-			p.Candidates = append(p.Candidates, Candidate{
-				Component:  c.Component,
-				Foundation: c.Foundation,
-				Generation: c.Generation,
-				ID:         c.ID,
-				IP:         c.IP,
-				Port:       c.Port,
-				Priority:   c.Priority,
-				Protocol:   c.Protocol,
-				Type:       c.Type,
-				RelAddr:    c.RelAddr,
-				RelPort:    c.RelPort,
-			})
+	for _, content := range jng.Contents {
+		if content.Transport != nil {
+			for _, c := range content.Transport.Candidates {
+				p.Candidates = append(p.Candidates, Candidate{
+					Component:  c.Component,
+					Foundation: c.Foundation,
+					Generation: c.Generation,
+					ID:         c.ID,
+					IP:         c.IP,
+					Port:       c.Port,
+					Priority:   c.Priority,
+					Protocol:   c.Protocol,
+					Type:       c.Type,
+					RelAddr:    c.RelAddr,
+					RelPort:    c.RelPort,
+				})
+			}
 		}
 
-		media := content.Description.Media
-		if media == "" {
-			media = content.Name
-		}
-
-		// build SDP media line
-		port := "9"
-		proto := "UDP/TLS/RTP/SAVPF"
-		if content.Name == "data" {
-			proto = "UDP/DTLS/SCTP"
-			if len(content.SCTP) > 0 {
-				p.DataChannel = &DataChannel{
-					Port:     content.SCTP[0].Port,
-					Protocol: content.SCTP[0].Protocol,
+		if content.Description != nil {
+			media := content.Description.Media
+			for _, src := range content.Description.Sources {
+				var name, label string
+				for _, p := range src.Parameters {
+					switch p.Name {
+					case "msid":
+						name = p.Value
+					case "label":
+						label = p.Value
+					}
 				}
-				port = content.SCTP[0].Port
-			}
-		}
-		sdpLines = append(sdpLines, "m="+media+" "+port+" "+proto+" 0")
-
-		// ICE credentials
-		if content.Transport.Ufrag != "" {
-			sdpLines = append(sdpLines, "a=ice-ufrag:"+content.Transport.Ufrag)
-			sdpLines = append(sdpLines, "a=ice-pwd:"+content.Transport.Pwd)
-		}
-
-		// fingerprint
-		for _, fp := range content.Transport.Fingerprint {
-			sdpLines = append(sdpLines, "a=fingerprint:"+fp.Hash+" "+strings.TrimSpace(fp.Content))
-			sdpLines = append(sdpLines, "a=setup:"+fp.Setup)
-		}
-
-		// candidates
-		for _, c := range content.Transport.Candidates {
-			line := "a=candidate:" + c.Foundation + " " + c.Component + " " + c.Protocol + " " + c.Priority + " " + c.IP + " " + c.Port + " typ " + c.Type
-			if c.RelAddr != "" {
-				line += " raddr " + c.RelAddr + " rport " + c.RelPort
-			}
-			sdpLines = append(sdpLines, line)
-		}
-
-		// sources
-		for _, src := range content.Description.Sources {
-			var name, label string
-			for _, param := range src.Params {
-				switch param.Name {
-				case "msid":
-					name = param.Value
-				case "label":
-					label = param.Value
+				s := Source{SSRC: src.SSRC, Name: name, Label: label}
+				switch media {
+				case "audio":
+					p.AudioSources = append(p.AudioSources, s)
+				case "video":
+					p.VideoSources = append(p.VideoSources, s)
 				}
 			}
-			s := Source{SSRC: src.SSRC, Name: name, Label: label}
-			switch media {
-			case "audio":
-				p.AudioSources = append(p.AudioSources, s)
-			case "video":
-				p.VideoSources = append(p.VideoSources, s)
+		}
+
+		if content.Name == "data" || (content.Description != nil && content.Description.SCTPMap != nil) ||
+			(content.Transport != nil && content.Transport.SCTPMap != nil) {
+			dc := &DataChannel{}
+			if content.Description != nil && content.Description.SCTPMap != nil {
+				dc.Port = content.Description.SCTPMap.Number
+				if dc.Port == "" {
+					dc.Port = content.Description.SCTPMap.Port
+				}
+				dc.Protocol = content.Description.SCTPMap.Protocol
 			}
+			if content.Transport != nil && content.Transport.SCTPMap != nil {
+				if dc.Port == "" {
+					dc.Port = content.Transport.SCTPMap.Number
+					if dc.Port == "" {
+						dc.Port = content.Transport.SCTPMap.Port
+					}
+				}
+				if dc.Protocol == "" {
+					dc.Protocol = content.Transport.SCTPMap.Protocol
+				}
+			}
+			p.DataChannel = dc
 		}
 	}
 
-	p.SDP = strings.Join(sdpLines, "\r\n") + "\r\n"
 	return p
 }
 

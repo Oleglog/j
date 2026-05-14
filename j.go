@@ -195,6 +195,21 @@ func (s *Session) Negotiator() *peer.Negotiator {
 	}
 }
 
+// WaitJingleReinitiate blocks until Jicofo sends a NEW session-initiate (e.g. after
+// session-terminate with reason "moving" or "general-error"). Returns the raw stanza.
+// Use this to drive a reconnect loop:
+//
+//	for {
+//	    neg := sess.Negotiator()
+//	    neg.PC = newPC
+//	    neg.Accept(ctx)
+//	    // … wait until pc reports connection failed / terminate received …
+//	    if _, err := sess.WaitJingleReinitiate(ctx); err != nil { return }
+//	}
+func (s *Session) WaitJingleReinitiate(ctx context.Context) (string, error) {
+	return s.Conn.WaitJingle(ctx)
+}
+
 // LowLevel returns the underlying XMPP connection so callers can issue raw XMPP/Jingle stanzas.
 func (s *Session) LowLevel() *xmpp.Conn { return s.Conn }
 

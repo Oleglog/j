@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 	"github.com/zarazaex69/j/internal/jingle"
@@ -52,6 +53,10 @@ func (n *Negotiator) SID() string {
 // → wait for ICE gathering complete → SendSessionAccept to Jicofo.
 //
 // Caller should have configured PC's transceivers/datachannels BEFORE calling Accept.
+// Accept performs SetRemoteDescription(offer) → CreateAnswer → SetLocalDescription(answer)
+// → wait for ICE gathering complete → SendSessionAccept to Jicofo.
+//
+// Caller should have configured PC's transceivers/datachannels BEFORE calling Accept.
 func (n *Negotiator) Accept(ctx context.Context) error {
 	if n.PC == nil || n.XMPP == nil {
 		return fmt.Errorf("peer: PC and XMPP must be set")
@@ -83,8 +88,12 @@ func (n *Negotiator) Accept(ctx context.Context) error {
 		return fmt.Errorf("set local desc: %w", err)
 	}
 
+	// Wait for ICE gathering to complete (or timeout) so the session-accept
+	// already contains all collected candidates. Late candidates after this
+	// will be sent via trickle (transport-info).
 	select {
 	case <-webrtc.GatheringCompletePromise(n.PC):
+	case <-time.After(3 * time.Second):
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -92,7 +101,41 @@ func (n *Negotiator) Accept(ctx context.Context) error {
 	final := n.PC.LocalDescription().SDP
 	jingleAccept := jingle.SDPToJingleAccept(final)
 
-	return n.XMPP.SendSessionAccept(n.parsed.SID, n.parsed.Initiator, n.RoomJID, jingleAccept)
+	if err := n.XMPP.SendSessionAccept(n.parsed.SID, n.parsed.Initiator, n.RoomJID, jingleAccept); err != nil {
+		return err
+	}
+
+	// trickle ICE: any candidates discovered AFTER we sent session-accept
+	// (e.g. late TURN allocations) get pushed via transport-info.
+	n.PC.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c == nil {
+			return
+		}
+		js := c.ToJSON()
+		raw := strings.TrimPrefix(js.Candidate, "candidate:")
+		mediaName := "audio"
+		if js.SDPMid != nil {
+			mediaName = mediaNameForMid(*js.SDPMid)
+		}
+		_ = n.SendTransportInfo(mediaName, raw)
+	})
+
+	return nil
+}
+
+// mediaNameForMid resolves a mid like "0"/"1" or "audio"/"video" to "audio" or "video".
+// Used for transport-info routing.
+func mediaNameForMid(mid string) string {
+	switch mid {
+	case "0", "audio":
+		return "audio"
+	case "1", "video":
+		return "video"
+	case "2", "data":
+		return "data"
+	default:
+		return mid
+	}
 }
 
 // SendTransportInfo announces additional ICE candidates to Jicofo (trickle ICE).
@@ -114,6 +157,20 @@ func (n *Negotiator) SendSourceAdd(sourcesXML string) error {
 		return err
 	}
 	return n.XMPP.SendJingle(n.RoomJID+"/focus", "source-add", n.parsed.SID, n.parsed.Initiator, sourcesXML)
+}
+
+// SendSourceAddFromSDP convenience: extracts <source>/<ssrc-group> elements per content
+// from the given local SDP (typically pc.LocalDescription().SDP after AddTrack) and
+// sends them via source-add to Jicofo.
+func (n *Negotiator) SendSourceAddFromSDP(sdp string) error {
+	if err := n.ensureParsed(); err != nil {
+		return err
+	}
+	xmlBody := jingle.SDPSourcesXML(sdp)
+	if xmlBody == "" {
+		return fmt.Errorf("peer: no <source> elements found in SDP")
+	}
+	return n.SendSourceAdd(xmlBody)
 }
 
 // SendSourceRemove removes previously announced sources.

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 	j "github.com/zarazaex69/j"
 	"github.com/zarazaex69/j/internal/colibri"
 )
@@ -24,6 +25,10 @@ func main() {
 	dc := flag.Bool("dc", false, "Bridge channel mode: stdin → broadcast EndpointMessage as text")
 	dcRaw := flag.Bool("dc-raw", false, "Bridge channel raw mode: pipe stdin → bridge → stdout (binary, base64-framed)")
 	media := flag.Bool("media", false, "Media mode: setup pion PeerConnection, send session-accept, print track events")
+	sendVideo := flag.Bool("send-video", false, "(media mode) attach a sendonly VP8 track and announce it to Jicofo")
+	bench := flag.Bool("bench", false, "Throughput benchmark: open colibri-ws, broadcast EndpointMessage at max rate, print Mbps")
+	benchSize := flag.Int("bench-size", 8192, "(bench) payload size per message in bytes")
+	benchSecs := flag.Int("bench-secs", 30, "(bench) duration of the benchmark in seconds")
 	timeout := flag.Duration("timeout", 5*time.Minute, "Timeout waiting for Jingle session")
 	flag.Parse()
 
@@ -38,8 +43,10 @@ func main() {
 	fmt.Fprintf(os.Stderr, "joining %s/%s as %s...\n", *host, *room, *nick)
 
 	switch {
+	case *bench:
+		runBench(ctx, *host, *room, *nick, *debug, *timeout, *benchSize, *benchSecs)
 	case *media:
-		runMedia(ctx, *host, *room, *nick, *debug, *timeout)
+		runMedia(ctx, *host, *room, *nick, *debug, *timeout, *sendVideo)
 	case *dcRaw:
 		runDCRaw(ctx, *host, *room, *nick, *debug, *timeout)
 	case *dc:
@@ -231,7 +238,7 @@ func runDCRaw(ctx context.Context, host, room, nick string, debug bool, timeout 
 	}
 }
 
-func runMedia(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration) {
+func runMedia(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration, sendVideo bool) {
 	jctx, jcancel := context.WithTimeout(ctx, timeout)
 	defer jcancel()
 
@@ -243,25 +250,58 @@ func runMedia(ctx context.Context, host, room, nick string, debug bool, timeout 
 	}
 	defer sess.Close()
 
+	for round := 1; ; round++ {
+		fmt.Fprintf(os.Stderr, "=== media round %d ===\n", round)
+		if err := acceptOnce(ctx, sess, sendVideo); err != nil {
+			fmt.Fprintf(os.Stderr, "round %d: %v\n", round, err)
+		}
+
+		// wait for next session-initiate (Jicofo "moving" or general-error reset)
+		fmt.Fprintln(os.Stderr, "waiting for next session-initiate (reconnect)…")
+		rictx, ricancel := context.WithTimeout(ctx, 30*time.Second)
+		_, werr := sess.WaitJingleReinitiate(rictx)
+		ricancel()
+		if werr != nil {
+			fmt.Fprintf(os.Stderr, "no reinitiate within timeout, exiting: %v\n", werr)
+			return
+		}
+		fmt.Fprintln(os.Stderr, "got new session-initiate, re-accepting")
+	}
+}
+
+// acceptOnce performs one full setup cycle: build pc, add tracks, Accept(),
+// drain media, and wait until pc is closed/failed or ctx done.
+func acceptOnce(ctx context.Context, sess *j.Session, sendVideo bool) error {
 	pc, err := webrtc.NewPeerConnection(sess.IceConfig())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "new pc: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("new pc: %w", err)
 	}
 	defer pc.Close()
 
-	// add a recvonly transceiver per media (so SDP answer matches offer order)
 	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
 		fmt.Fprintf(os.Stderr, "add audio recvonly: %v\n", err)
 	}
-	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
-		fmt.Fprintf(os.Stderr, "add video recvonly: %v\n", err)
+
+	var localVideo *webrtc.TrackLocalStaticSample
+	if sendVideo {
+		localVideo, err = webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
+			"jvideo", "jstream")
+		if err != nil {
+			return fmt.Errorf("new track: %w", err)
+		}
+		if _, err := pc.AddTrack(localVideo); err != nil {
+			return fmt.Errorf("add track: %w", err)
+		}
+	} else {
+		if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
+			fmt.Fprintf(os.Stderr, "add video recvonly: %v\n", err)
+		}
 	}
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		fmt.Fprintf(os.Stderr, "[track] kind=%s id=%s codec=%s ssrc=%d\n",
 			track.Kind(), track.ID(), track.Codec().MimeType, track.SSRC())
-		// drain so SRTP isn't stuck
 		buf := make([]byte, 1500)
 		var pkts uint64
 		for {
@@ -274,22 +314,155 @@ func runMedia(ctx context.Context, host, room, nick string, debug bool, timeout 
 		}
 	})
 
+	done := make(chan struct{}, 1)
 	pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
 		fmt.Fprintf(os.Stderr, "ICE: %s\n", s)
 	})
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		fmt.Fprintf(os.Stderr, "PC: %s\n", s)
+		switch s {
+		case webrtc.PeerConnectionStateFailed,
+			webrtc.PeerConnectionStateDisconnected,
+			webrtc.PeerConnectionStateClosed:
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		}
 	})
 
 	neg := sess.Negotiator()
 	neg.PC = pc
 	if err := neg.Accept(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "accept: %v\n", err)
+		return fmt.Errorf("accept: %w", err)
+	}
+
+	if sendVideo && localVideo != nil {
+		fmt.Fprintln(os.Stderr, "video track included in session-accept SDP")
+		go feedDummyVP8(ctx, localVideo)
+	}
+
+	fmt.Fprintln(os.Stderr, "session-accept sent")
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+	_ = neg.Terminate("success")
+	return nil
+}
+
+// feedDummyVP8 writes a tiny black VP8 keyframe at 30fps. Used purely as a
+// "we're alive" signal so the bridge can route our SSRC. Real apps would
+// pipe ffmpeg / encoded frames here.
+func feedDummyVP8(ctx context.Context, t *webrtc.TrackLocalStaticSample) {
+	// 64x64 black VP8 keyframe (precomputed)
+	frame := dummyVP8Keyframe()
+	tick := time.NewTicker(33 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			_ = t.WriteSample(media.Sample{Data: frame, Duration: 33 * time.Millisecond})
+		}
+	}
+}
+
+// dummyVP8Keyframe returns a 1x1 black VP8 keyframe (well-formed, ~30 bytes).
+// Generated once via libvpx; reused as filler data.
+func dummyVP8Keyframe() []byte {
+	return []byte{
+		0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a, 0x01, 0x00, 0x01, 0x00, 0x00, 0xc0,
+		0xfd, 0x07, 0x86, 0x83, 0x97, 0xff, 0xfe, 0xfb, 0x9f, 0x00, 0x00,
+	}
+}
+
+// runBench measures colibri-ws throughput. Bot 1 (this) sends, bot 2 (also -bench)
+// receives. Stats printed every 2s plus a final summary.
+func runBench(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration, payloadSize, secs int) {
+	jctx, jcancel := context.WithTimeout(ctx, timeout)
+	defer jcancel()
+
+	fmt.Fprintln(os.Stderr, "joining and waiting for jingle session-initiate...")
+	sess, err := j.Join(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer sess.Close()
+	if err := sess.OpenBridge(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "open bridge: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Fprintln(os.Stderr, "session-accept sent. waiting (Ctrl+C to quit)…")
-	<-ctx.Done()
+	fmt.Fprintf(os.Stderr, "bench: payload=%dB duration=%ds\n", payloadSize, secs)
+
+	// payload (random-ish; doesn't really matter, JVB doesn't inspect)
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i & 0xFF)
+	}
+
+	var rxBytes uint64
+	var rxMsgs uint64
+	go func() {
+		for m := range sess.BridgeMessages() {
+			if m.Class != "EndpointMessage" {
+				continue
+			}
+			raw := colibri.DecodeRaw(m)
+			if raw == nil {
+				continue
+			}
+			rxBytes += uint64(len(raw))
+			rxMsgs++
+		}
+	}()
+
+	// stats ticker
+	tickStop := make(chan struct{})
+	go func() {
+		var lastBytes uint64
+		var lastMsgs uint64
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-tickStop:
+				return
+			case <-t.C:
+				bps := float64(rxBytes-lastBytes) * 8 / 2.0
+				mps := rxMsgs - lastMsgs
+				lastBytes = rxBytes
+				lastMsgs = rxMsgs
+				fmt.Fprintf(os.Stderr, "[bench] rx %.2f Mbit/s, %d msg/s (total: %d msgs, %.2f MB)\n",
+					bps/1e6, mps/2, rxMsgs, float64(rxBytes)/1e6)
+			}
+		}
+	}()
+
+	// sender
+	deadline := time.Now().Add(time.Duration(secs) * time.Second)
+	var txBytes uint64
+	var txMsgs uint64
+	t0 := time.Now()
+	for time.Now().Before(deadline) {
+		if err := sess.BridgeSendRaw("", payload); err != nil {
+			fmt.Fprintf(os.Stderr, "send err: %v\n", err)
+			break
+		}
+		txBytes += uint64(payloadSize)
+		txMsgs++
+	}
+	close(tickStop)
+	dt := time.Since(t0).Seconds()
+
+	fmt.Fprintf(os.Stderr, "\n=== bench results ===\n")
+	fmt.Fprintf(os.Stderr, "duration:    %.2fs\n", dt)
+	fmt.Fprintf(os.Stderr, "tx:          %d msgs, %.2f MB, %.2f Mbit/s, %.0f msg/s\n",
+		txMsgs, float64(txBytes)/1e6, float64(txBytes)*8/dt/1e6, float64(txMsgs)/dt)
+	fmt.Fprintf(os.Stderr, "rx (echoed): %d msgs, %.2f MB\n", rxMsgs, float64(rxBytes)/1e6)
 }
 
 func readLines(ctx context.Context) <-chan string {

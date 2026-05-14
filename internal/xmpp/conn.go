@@ -14,16 +14,19 @@ import (
 )
 
 type Conn struct {
-	ws      *websocket.Conn
-	host    string
-	room    string
-	jid     string
-	nick    string
-	debug   bool
-	mu      sync.Mutex
-	ackH    atomic.Int64
-	stanzas chan string
-	closed  chan struct{}
+	ws        *websocket.Conn
+	host      string
+	room      string
+	jid       string
+	nick      string
+	debug     bool
+	mu        sync.Mutex
+	ackH      atomic.Int64
+	idSeq     atomic.Int64
+	lastJngMu sync.Mutex
+	lastJng   string
+	stanzas   chan string
+	closed    chan struct{}
 }
 
 type Service struct {
@@ -65,6 +68,17 @@ func Dial(ctx context.Context, host, room string, debug bool) (*Conn, error) {
 
 func (c *Conn) JID() string  { return c.jid }
 func (c *Conn) Nick() string { return c.nick }
+func (c *Conn) Host() string { return c.host }
+func (c *Conn) Room() string { return c.room }
+
+// Send transmits an arbitrary XMPP stanza string. Caller is responsible for valid XML
+// (and for adding xmlns="jabber:client" on iq/presence/message).
+func (c *Conn) Send(s string) error { return c.send(s) }
+
+// NextID returns a unique stanza id for outgoing IQs.
+func (c *Conn) NextID() string {
+	return fmt.Sprintf("j-%d", c.idSeq.Add(1))
+}
 
 // Stanzas returns the channel of incoming non-management XMPP stanzas.
 func (c *Conn) Stanzas() <-chan string { return c.stanzas }
@@ -336,6 +350,9 @@ func (c *Conn) WaitJingle(ctx context.Context) (string, error) {
 		select {
 		case msg := <-c.stanzas:
 			if strings.Contains(msg, "jingle") && strings.Contains(msg, "session-initiate") {
+				c.lastJngMu.Lock()
+				c.lastJng = msg
+				c.lastJngMu.Unlock()
 				return msg, nil
 			}
 		case <-ctx.Done():
@@ -346,9 +363,26 @@ func (c *Conn) WaitJingle(ctx context.Context) (string, error) {
 	}
 }
 
+// LastJingleStanza returns the most recently received Jingle session-initiate raw stanza.
+func (c *Conn) LastJingleStanza() string {
+	c.lastJngMu.Lock()
+	defer c.lastJngMu.Unlock()
+	return c.lastJng
+}
+
 func (c *Conn) SendSessionAccept(sid, initiator, roomJID, sdp string) error {
 	iq := fmt.Sprintf(`<iq to="%s" type="set" id="accept_1" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" sid="%s" initiator="%s" responder="%s">%s</jingle></iq>`,
 		roomJID+"/focus", sid, initiator, c.jid, sdp)
+	return c.send(iq)
+}
+
+// SendJingle sends an arbitrary Jingle action (transport-info, source-add, source-remove,
+// session-terminate, …). innerXML is the body inside <jingle …>.
+func (c *Conn) SendJingle(to, action, sid, initiator string, innerXML string) error {
+	id := c.NextID()
+	iq := fmt.Sprintf(
+		`<iq to="%s" type="set" id="%s" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="%s" sid="%s" initiator="%s" responder="%s">%s</jingle></iq>`,
+		to, id, action, sid, initiator, c.jid, innerXML)
 	return c.send(iq)
 }
 

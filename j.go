@@ -7,8 +7,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/webrtc/v4"
 	"github.com/zarazaex69/j/internal/colibri"
 	"github.com/zarazaex69/j/internal/jingle"
+	"github.com/zarazaex69/j/internal/peer"
 	"github.com/zarazaex69/j/internal/xmpp"
 )
 
@@ -175,6 +177,38 @@ func (s *Session) BridgeMessages() <-chan BridgeMessage {
 		return nil
 	}
 	return br.Messages()
+}
+
+// Negotiator returns a *peer.Negotiator wired to this session for use with a pion
+// PeerConnection. Caller sets pc.PC and pc.OnRemote, then calls pc.Accept(ctx) to
+// perform SDP negotiation and send session-accept to Jicofo.
+//
+//	neg := sess.Negotiator()
+//	neg.PC = myPionPC
+//	neg.OnRemote = func(t *webrtc.TrackRemote, _ *webrtc.RTPReceiver) { … }
+//	if err := neg.Accept(ctx); err != nil { … }
+func (s *Session) Negotiator() *peer.Negotiator {
+	return &peer.Negotiator{
+		XMPP:         s.Conn,
+		JingleStanza: s.Conn.LastJingleStanza(),
+		RoomJID:      s.RoomJID,
+	}
+}
+
+// LowLevel returns the underlying XMPP connection so callers can issue raw XMPP/Jingle stanzas.
+func (s *Session) LowLevel() *xmpp.Conn { return s.Conn }
+
+// IceConfig returns ICE servers as a pion-ready webrtc.Configuration.
+func (s *Session) IceConfig() webrtc.Configuration {
+	var srvs []webrtc.ICEServer
+	for _, ice := range s.ICEServers {
+		srvs = append(srvs, webrtc.ICEServer{
+			URLs:       ice.URLs,
+			Username:   ice.Username,
+			Credential: ice.Credential,
+		})
+	}
+	return webrtc.Configuration{ICEServers: srvs}
 }
 
 func (s *Session) Accept(sdp string) error {

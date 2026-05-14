@@ -21,6 +21,9 @@ func SDPToJingleAccept(sdp string) string {
 		}
 	}
 
+	// extract shared transport (BUNDLE master usually carries fingerprint/ICE/candidates)
+	shared := extractSharedTransport(mediaSections)
+
 	if len(bundleMids) > 0 {
 		b.WriteString(`<group xmlns="urn:xmpp:jingle:apps:grouping:0" semantics="BUNDLE">`)
 		for _, m := range bundleMids {
@@ -30,10 +33,47 @@ func SDPToJingleAccept(sdp string) string {
 	}
 
 	for _, sec := range mediaSections.media {
-		writeJingleContent(&b, sec)
+		writeJingleContent(&b, sec, shared)
 	}
 
 	return b.String()
+}
+
+// sharedTransport holds fingerprint/ICE creds/candidates that can be shared across
+// all bundled media sections (since pion only writes them on the BUNDLE master).
+type sharedTransport struct {
+	ufrag       string
+	pwd         string
+	fingerprint string // "<hash> <value>"
+	setup       string
+	candidates  []string // SDP candidate lines (without leading "a=")
+}
+
+func extractSharedTransport(s sdpSplit) sharedTransport {
+	var st sharedTransport
+	for _, sec := range s.media {
+		lines := splitLines(sec)
+		if st.ufrag == "" {
+			st.ufrag = getAttr(lines, "ice-ufrag")
+		}
+		if st.pwd == "" {
+			st.pwd = getAttr(lines, "ice-pwd")
+		}
+		if st.fingerprint == "" {
+			st.fingerprint = getAttr(lines, "fingerprint")
+		}
+		if st.setup == "" {
+			st.setup = getAttr(lines, "setup")
+		}
+		if len(st.candidates) == 0 {
+			for _, l := range lines {
+				if strings.HasPrefix(l, "a=candidate:") {
+					st.candidates = append(st.candidates, strings.TrimPrefix(l, "a=candidate:"))
+				}
+			}
+		}
+	}
+	return st
 }
 
 type sdpSplit struct {
@@ -50,7 +90,7 @@ func splitSDP(sdp string) sdpSplit {
 	return res
 }
 
-func writeJingleContent(b *strings.Builder, mediaSection string) {
+func writeJingleContent(b *strings.Builder, mediaSection string, shared sharedTransport) {
 	lines := splitLines(mediaSection)
 	if len(lines) == 0 {
 		return
@@ -71,15 +111,17 @@ func writeJingleContent(b *strings.Builder, mediaSection string) {
 		mid = mediaType
 	}
 
-	// senders mapping
+	// senders mapping (Jingle semantics: initiator=offerer, responder=us)
+	// SDP a=sendonly  → only we send → senders="responder"
+	// SDP a=recvonly  → only offerer sends → senders="initiator"
 	senders := "both"
 	switch {
 	case hasAttrFlag(lines, "sendrecv"):
 		senders = "both"
 	case hasAttrFlag(lines, "sendonly"):
-		senders = "initiator"
-	case hasAttrFlag(lines, "recvonly"):
 		senders = "responder"
+	case hasAttrFlag(lines, "recvonly"):
+		senders = "initiator"
 	case hasAttrFlag(lines, "inactive"):
 		senders = "none"
 	}
@@ -93,7 +135,7 @@ func writeJingleContent(b *strings.Builder, mediaSection string) {
 			port = "5000"
 		}
 		fmt.Fprintf(b, `<description xmlns="urn:xmpp:jingle:transports:dtls-sctp:1"/>`)
-		writeJingleTransport(b, lines, port)
+		writeJingleTransport(b, lines, port, shared)
 	} else {
 		// audio/video
 		fmt.Fprintf(b, `<description xmlns="urn:xmpp:jingle:apps:rtp:1" media="%s">`, mediaType)
@@ -105,7 +147,7 @@ func writeJingleContent(b *strings.Builder, mediaSection string) {
 		writeSources(b, lines)
 		writeSSRCGroups(b, lines)
 		b.WriteString("</description>")
-		writeJingleTransport(b, lines, "")
+		writeJingleTransport(b, lines, "", shared)
 	}
 
 	b.WriteString("</content>")
@@ -260,14 +302,23 @@ func writeSSRCGroups(b *strings.Builder, lines []string) {
 	}
 }
 
-func writeJingleTransport(b *strings.Builder, lines []string, sctpPort string) {
+func writeJingleTransport(b *strings.Builder, lines []string, sctpPort string, shared sharedTransport) {
 	ufrag := getAttr(lines, "ice-ufrag")
+	if ufrag == "" {
+		ufrag = shared.ufrag
+	}
 	pwd := getAttr(lines, "ice-pwd")
+	if pwd == "" {
+		pwd = shared.pwd
+	}
 	fmt.Fprintf(b, `<transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="%s" pwd="%s">`,
 		xmlAttr(ufrag), xmlAttr(pwd))
 
 	// fingerprint
 	fp := getAttr(lines, "fingerprint")
+	if fp == "" {
+		fp = shared.fingerprint
+	}
 	if fp != "" {
 		sp := strings.Index(fp, " ")
 		if sp >= 0 {
@@ -275,18 +326,28 @@ func writeJingleTransport(b *strings.Builder, lines []string, sctpPort string) {
 			val := fp[sp+1:]
 			setup := getAttr(lines, "setup")
 			if setup == "" {
+				setup = shared.setup
+			}
+			if setup == "" {
 				setup = "active"
 			}
 			fmt.Fprintf(b, `<fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="%s" setup="%s">%s</fingerprint>`, hash, setup, val)
 		}
 	}
 
-	// candidates
+	// candidates — prefer per-section, fall back to shared
+	wroteCandidate := false
 	for _, line := range lines {
 		if !strings.HasPrefix(line, "a=candidate:") {
 			continue
 		}
 		writeJingleCandidate(b, strings.TrimPrefix(line, "a=candidate:"))
+		wroteCandidate = true
+	}
+	if !wroteCandidate {
+		for _, raw := range shared.candidates {
+			writeJingleCandidate(b, raw)
+		}
 	}
 
 	// SCTP map

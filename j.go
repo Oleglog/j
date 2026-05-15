@@ -122,6 +122,20 @@ type Session struct {
 // BridgeMessage is the type returned by the Bridge() channel — see internal/colibri.Message.
 type BridgeMessage = colibri.Message
 
+// RequestVideo sends ReceiverVideoConstraints to the bridge, telling JVB to forward
+// video streams to this endpoint. Without this call, JVB will NOT send any video.
+// maxHeight is the max resolution (e.g. 720, 360, 180). Use -1 for lastN to receive all.
+func (s *Session) RequestVideo(ctx context.Context, maxHeight int) error {
+	if err := s.OpenBridge(ctx); err != nil {
+		return err
+	}
+	return s.bridge.SendJSON(map[string]any{
+		"colibriClass":       "ReceiverVideoConstraints",
+		"lastN":              -1,
+		"defaultConstraints": map[string]any{"maxHeight": maxHeight},
+	})
+}
+
 // OpenBridge connects to the Jitsi bridge channel (colibri-ws) using the URL from the
 // Jingle session-initiate. Subsequent calls return the existing connection.
 func (s *Session) OpenBridge(ctx context.Context) error {

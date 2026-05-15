@@ -15,6 +15,7 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 	j "github.com/zarazaex69/j"
 	"github.com/zarazaex69/j/internal/colibri"
+	"github.com/zarazaex69/j/internal/peer"
 )
 
 func main() {
@@ -338,12 +339,71 @@ func acceptOnce(ctx context.Context, sess *j.Session, sendVideo bool) error {
 	neg := sess.Negotiator()
 	neg.PC = pc
 	if err := neg.Accept(ctx); err != nil {
-		return fmt.Errorf("accept: %w", err)
+		if peer.IsPlanBError(err) {
+			fmt.Fprintln(os.Stderr, "detected Plan B offer, recreating PC with PlanB semantics...")
+			pc.Close()
+			cfg := sess.IceConfig()
+			cfg.SDPSemantics = webrtc.SDPSemanticsPlanB
+			pc, err = webrtc.NewPeerConnection(cfg)
+			if err != nil {
+				return fmt.Errorf("new pc (planb): %w", err)
+			}
+			defer pc.Close()
+			if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
+				fmt.Fprintf(os.Stderr, "add audio recvonly: %v\n", err)
+			}
+			if sendVideo {
+				localVideo, _ = webrtc.NewTrackLocalStaticSample(
+					webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
+					"jvideo", "jstream")
+				pc.AddTrack(localVideo)
+			} else {
+				pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly})
+			}
+			pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+				fmt.Fprintf(os.Stderr, "[track] kind=%s id=%s codec=%s ssrc=%d\n",
+					track.Kind(), track.ID(), track.Codec().MimeType, track.SSRC())
+				buf := make([]byte, 1500)
+				var pkts uint64
+				for {
+					_, _, err := track.Read(buf)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "[track ssrc=%d] closed: %v (rx=%d packets)\n", track.SSRC(), err, pkts)
+						return
+					}
+					pkts++
+				}
+			})
+			pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+				fmt.Fprintf(os.Stderr, "PC: %s\n", s)
+				switch s {
+				case webrtc.PeerConnectionStateFailed,
+					webrtc.PeerConnectionStateDisconnected,
+					webrtc.PeerConnectionStateClosed:
+					select {
+					case done <- struct{}{}:
+					default:
+					}
+				}
+			})
+			neg = sess.Negotiator()
+			neg.PC = pc
+			if err := neg.Accept(ctx); err != nil {
+				return fmt.Errorf("accept (planb): %w", err)
+			}
+		} else {
+			return fmt.Errorf("accept: %w", err)
+		}
 	}
 
 	if sendVideo && localVideo != nil {
 		fmt.Fprintln(os.Stderr, "video track included in session-accept SDP")
 		go feedDummyVP8(ctx, localVideo)
+	}
+
+	// Request video from bridge — without this JVB won't forward any video
+	if err := sess.RequestVideo(ctx, 720); err != nil {
+		fmt.Fprintf(os.Stderr, "request video: %v\n", err)
 	}
 
 	fmt.Fprintln(os.Stderr, "session-accept sent")

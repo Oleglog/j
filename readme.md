@@ -24,6 +24,8 @@ SDP/ICE/SSRC, открывает bridge channel (colibri-ws) и интегрир
 - Jingle XML ↔ SDP полный конвертер (BUNDLE, RTP payload-types, RTCP-FB, SSRC, fingerprint, ICE candidates, rtcp-mux фильтрация)
 - Привязка `*webrtc.PeerConnection` (pion) к Jingle сессии: автоматический session-accept, **trickle ICE**, **reconnect** при `session-terminate moving`
 - **Отправка sendonly видео-трека** (попадает в session-accept SDP, Jicofo раздаёт другим участникам)
+- **Приём видео**: `RequestVideo(ctx, maxHeight)` — отправляет `ReceiverVideoConstraints` через bridge channel (без этого JVB не форвардит видео!)
+- **Plan B detection**: `Negotiator.Accept` определяет Plan B offer, `peer.IsPlanBError(err)` для обработки
 - `source-add` / `source-remove` / `transport-info` / `session-terminate` хелперы
 - colibri-ws (modern Jitsi data channel) — broadcast/unicast `EndpointMessage`, **сырые байты** через base64
 - Чат groupchat, raise/lower hand, leave
@@ -164,6 +166,9 @@ neg.PC = pc
 if err := neg.Accept(ctx); err != nil { panic(err) }
 defer neg.Terminate("success")
 
+// ВАЖНО: без этого JVB НЕ будет форвардить видео!
+sess.RequestVideo(ctx, 720)
+
 // ICE candidates обнаруженные ПОСЛЕ session-accept автоматически
 // уйдут через transport-info (trickle ICE)
 
@@ -172,6 +177,52 @@ go func() {
     for { videoTrack.WriteSample(media.Sample{Data: vp8Frame, Duration: 33*time.Millisecond}) }
 }()
 ```
+
+### Получение видео (ReceiverVideoConstraints)
+
+**Критически важно**: JVB не форвардит видео пока получатель не отправит
+`ReceiverVideoConstraints` через bridge channel. Без этого `OnTrack` никогда не сработает.
+
+```go
+// Простой вариант — запросить всё видео в 720p:
+sess.RequestVideo(ctx, 720)
+
+// Или вручную через bridge для тонкой настройки:
+sess.OpenBridge(ctx)
+sess.Bridge().SendJSON(map[string]any{
+    "colibriClass":       "ReceiverVideoConstraints",
+    "lastN":              3,                              // макс 3 видеопотока
+    "onStageSources":     []string{"alice-v0"},           // приоритетный источник
+    "defaultConstraints": map[string]any{"maxHeight": 180},
+    "constraints": map[string]any{
+        "alice-v0": map[string]any{"maxHeight": 720},     // alice в HD
+    },
+})
+```
+
+### Plan B (несколько участников с видео)
+
+Когда в комнате уже есть участники с видео, Jicofo шлёт offer в **Plan B** формате
+(несколько SSRC в одном `m=video`). pion по умолчанию ожидает Unified Plan и упадёт.
+
+```go
+neg := sess.Negotiator()
+neg.PC = pc
+err := neg.Accept(ctx)
+if peer.IsPlanBError(err) {
+    // Пересоздать PC с Plan B семантикой
+    pc.Close()
+    cfg := sess.IceConfig()
+    cfg.SDPSemantics = webrtc.SDPSemanticsPlanB
+    pc, _ = webrtc.NewPeerConnection(cfg)
+    // ... добавить transceivers/tracks заново ...
+    neg = sess.Negotiator()
+    neg.PC = pc
+    neg.Accept(ctx)
+}
+```
+
+CLI `-media` делает это автоматически.
 
 ### Reconnect loop (session-terminate moving)
 

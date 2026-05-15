@@ -73,11 +73,29 @@ func (n *Negotiator) Accept(ctx context.Context) error {
 	}
 
 	offerSDP := jingle.JingleToSDP(n.parsed)
-	if err := n.PC.SetRemoteDescription(webrtc.SessionDescription{
-		Type: webrtc.SDPTypeOffer,
-		SDP:  offerSDP,
-	}); err != nil {
-		return fmt.Errorf("set remote desc: %w", err)
+
+	// Detect Plan B: if a single m=video section contains multiple SSRCs from
+	// different sources, pion's UnifiedPlan will reject it. Detect and error
+	// so caller can recreate PC with SDPSemanticsPlanB.
+	if isPlanB(offerSDP) {
+		// Try setting with current PC — if it fails, return a typed error
+		err := n.PC.SetRemoteDescription(webrtc.SessionDescription{
+			Type: webrtc.SDPTypeOffer,
+			SDP:  offerSDP,
+		})
+		if err != nil && strings.Contains(err.Error(), "PlanB") {
+			return fmt.Errorf("peer: remote SDP is Plan B — recreate PeerConnection with webrtc.SDPSemanticsPlanB: %w", err)
+		}
+		if err != nil {
+			return fmt.Errorf("set remote desc: %w", err)
+		}
+	} else {
+		if err := n.PC.SetRemoteDescription(webrtc.SessionDescription{
+			Type: webrtc.SDPTypeOffer,
+			SDP:  offerSDP,
+		}); err != nil {
+			return fmt.Errorf("set remote desc: %w", err)
+		}
 	}
 
 	answer, err := n.PC.CreateAnswer(nil)
@@ -234,4 +252,35 @@ func buildJingleCandidateXML(raw string) string {
 		out += fmt.Sprintf(` tcptype="%s"`, tcptype)
 	}
 	return out + "/>"
+}
+
+// isPlanB detects Plan B SDP: multiple a=ssrc lines with different cname values
+// in a single m=video section (Jicofo sends this when other participants have video).
+func isPlanB(sdp string) bool {
+	inVideo := false
+	cnames := map[string]struct{}{}
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "m=video") {
+			inVideo = true
+			cnames = map[string]struct{}{}
+		} else if strings.HasPrefix(line, "m=") {
+			if inVideo && len(cnames) > 1 {
+				return true
+			}
+			inVideo = false
+		}
+		if inVideo && strings.HasPrefix(line, "a=ssrc:") && strings.Contains(line, "cname:") {
+			parts := strings.SplitN(line, "cname:", 2)
+			if len(parts) == 2 {
+				cnames[strings.TrimSpace(parts[1])] = struct{}{}
+			}
+		}
+	}
+	return inVideo && len(cnames) > 1
+}
+
+// IsPlanBError returns true if the error from Accept indicates a Plan B SDP mismatch.
+func IsPlanBError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Plan B")
 }

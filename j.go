@@ -3,6 +3,7 @@ package j
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -330,10 +331,15 @@ func (s *Session) Close() error {
 		// healthy bridge this returns in tens of milliseconds; on a
 		// wedged one we still bail before the websocket teardown.
 		if err := s.Conn.LeaveMUCWait(s.room, 5*time.Second); err != nil {
-			// Fall back to fire-and-forget + short grace so we don't
-			// regress hard if the server is wedged.
+			// Log the failure so callers can correlate ghost-participant
+			// reports with concrete handshake outcomes; then fall back to
+			// fire-and-forget + short grace so we don't regress hard if
+			// the server is wedged.
+			log.Printf("j: leave-muc handshake failed for room %s: %v (falling back to fire-and-forget)", s.room, err)
 			_ = s.Conn.LeaveMUC(s.room)
 			time.Sleep(200 * time.Millisecond)
+		} else {
+			log.Printf("j: leave-muc handshake ok for room %s", s.room)
 		}
 	}
 	return s.Conn.Close()

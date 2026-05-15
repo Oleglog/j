@@ -29,6 +29,7 @@ type Conn struct {
 	occupants map[string]struct{} // MUC nick → present (excluding self and "focus")
 	stanzas   chan string
 	closed    chan struct{}
+	closeOnce sync.Once
 
 	// waitMu protects the per-stanza waiter maps below.
 	waitMu sync.Mutex
@@ -40,6 +41,12 @@ type Conn struct {
 	// echoed back by Prosody — the XMPP equivalent of MUC_LEFT used in
 	// lib-jitsi-meet. Nil when no LeaveMUCWait is in flight.
 	leaveWaiter chan struct{}
+	// smAckWaiter fires when we receive a stream-management <a h=N/>
+	// stanza. Used by the keepalive goroutine to detect a wedged or
+	// silently-disconnected XMPP websocket: if our periodic <r/> doesn't
+	// elicit a response, the connection is dead and we shut it down so
+	// Prosody can drop us from the MUC promptly.
+	smAckWaiter chan struct{}
 }
 
 type Service struct {
@@ -78,6 +85,7 @@ func Dial(ctx context.Context, host, room string, debug bool) (*Conn, error) {
 	}
 
 	go c.readLoop()
+	go c.keepaliveLoop()
 	return c, nil
 }
 
@@ -98,22 +106,117 @@ func (c *Conn) NextID() string {
 // Stanzas returns the channel of incoming non-management XMPP stanzas.
 func (c *Conn) Stanzas() <-chan string { return c.stanzas }
 
-func (c *Conn) Close() error {
-	select {
-	case <-c.closed:
-	default:
-		close(c.closed)
+// keepaliveLoop periodically pokes the XMPP websocket with a stream
+// management <r/> request and verifies that Prosody answers with an
+// <a h=N/> ack. If three consecutive cycles fail to elicit an ack we
+// declare the connection dead and shut it down.
+//
+// Why we need this: the e2e test fixture observed 90s windows where
+// nothing flowed over XMPP because the application-level data carrier
+// (seichannel) was wedged on RTP. In that quiet stretch, Prosody can
+// drop us from the bind and our subsequent <presence type="unavailable"/>
+// goes into a black hole, leaving ghost participants in the MUC for
+// minutes — which is exactly the symptom we kept hitting on back-to-back
+// runs of the same room. Keeping the channel pingable so that either the
+// server keeps us alive or we detect death promptly mirrors what
+// Strophe.js does for lib-jitsi-meet.
+//
+// Tunables: 30s between pings is well below typical server bind-idle
+// timeouts (Prosody mod_smacks defaults to ~5 minutes) but high enough
+// to be invisible in the protocol log. 10s ack window covers the
+// worst-case meet.cryptopro.ru round trip we've measured.
+func (c *Conn) keepaliveLoop() {
+	const (
+		interval = 30 * time.Second
+		ackWait  = 10 * time.Second
+	)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-c.closed:
+			return
+		case <-t.C:
+		}
+
+		// Arm an ack waiter before sending so a fast server reply can't
+		// race us. If a previous cycle's waiter is still pending (which
+		// shouldn't normally happen) we just keep using it.
+		w := make(chan struct{})
+		c.waitMu.Lock()
+		if c.smAckWaiter == nil {
+			c.smAckWaiter = w
+		} else {
+			w = c.smAckWaiter
+		}
+		c.waitMu.Unlock()
+
+		if err := c.send(`<r xmlns="urn:xmpp:sm:3"/>`); err != nil {
+			// send already marked the connection closed; just exit.
+			return
+		}
+
+		select {
+		case <-w:
+			// Ack received; loop and wait for the next tick.
+		case <-c.closed:
+			return
+		case <-time.After(ackWait):
+			// No ack within the window — the websocket is wedged.
+			// Shut it down so writers fail fast and Prosody sees the
+			// underlying TCP go away (which prompts MUC cleanup on
+			// the server side instead of waiting for its own idle
+			// timeout, minutes from now).
+			c.waitMu.Lock()
+			if c.smAckWaiter == w {
+				c.smAckWaiter = nil
+			}
+			c.waitMu.Unlock()
+			c.markClosed()
+			_ = c.ws.Close(websocket.StatusGoingAway, "keepalive timeout")
+			return
+		}
 	}
+}
+
+func (c *Conn) Close() error {
+	// markClosed is the only place that flips c.closed. Use a sync.Once
+	// because both Close() and the readLoop's deferred close path can
+	// race to mark the connection dead, and we want at most one close.
+	c.markClosed()
 	return c.ws.Close(websocket.StatusNormalClosure, "")
 }
 
+// markClosed signals all waiters (LeaveMUCWait, SendIQWait, keepalive,
+// etc.) that the underlying websocket is no longer usable. Idempotent.
+func (c *Conn) markClosed() {
+	c.closeOnce.Do(func() { close(c.closed) })
+}
+
 func (c *Conn) send(s string) error {
+	// Refuse writes once the connection has been declared dead so
+	// callers see an immediate error instead of having their bytes
+	// silently swallowed by a half-shut websocket. This is what makes
+	// LeaveMUCWait return promptly on a dead Prosody link instead of
+	// burning its full 5s timeout.
+	select {
+	case <-c.closed:
+		return fmt.Errorf("xmpp connection closed")
+	default:
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.debug {
 		fmt.Fprintf(os.Stderr, "[xmpp] -> %s\n", s)
 	}
-	return c.ws.Write(context.Background(), websocket.MessageText, []byte(s))
+	if err := c.ws.Write(context.Background(), websocket.MessageText, []byte(s)); err != nil {
+		// Write failure means the websocket is gone. Mark closed so
+		// any goroutine still blocked on c.closed wakes up.
+		c.markClosed()
+		return err
+	}
+	return nil
 }
 
 func (c *Conn) readOne(ctx context.Context) (string, error) {
@@ -125,6 +228,11 @@ func (c *Conn) readOne(ctx context.Context) (string, error) {
 }
 
 func (c *Conn) readLoop() {
+	// On exit (read error, server FIN, etc.) signal every waiter and
+	// the keepalive goroutine that the connection is dead. Without
+	// this, callers blocked in LeaveMUCWait / SendIQWait keep waiting
+	// for stanzas that will never arrive.
+	defer c.markClosed()
 	for {
 		select {
 		case <-c.closed:
@@ -144,6 +252,17 @@ func (c *Conn) readLoop() {
 			continue
 		}
 		if strings.HasPrefix(msg, "<a ") || strings.Contains(msg, "<a xmlns=\"urn:xmpp:sm:3\"") || strings.Contains(msg, "<a xmlns='urn:xmpp:sm:3'") {
+			// Wake any pending keepalive ack waiter. The check inside
+			// the lock keeps us from racing with keepalive setting up
+			// a new waiter for the next cycle.
+			c.waitMu.Lock()
+			if w := c.smAckWaiter; w != nil {
+				c.smAckWaiter = nil
+				c.waitMu.Unlock()
+				close(w)
+			} else {
+				c.waitMu.Unlock()
+			}
 			continue
 		}
 		c.ackH.Add(1)

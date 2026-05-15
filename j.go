@@ -317,9 +317,24 @@ func (s *Session) Close() error {
 	s.bridgeMu.Unlock()
 
 	if s.room != "" {
-		_ = s.Conn.LeaveMUC(s.room)
-		// give server a moment to receive it
-		time.Sleep(100 * time.Millisecond)
+		// Wait for Prosody to echo our unavailable presence back: that's
+		// the XMPP-level confirmation that we've been removed from the
+		// MUC roster (same handshake lib-jitsi-meet's ChatRoom.leave
+		// awaits via XMPPEvents.MUC_LEFT). Without it, ripping the
+		// websocket immediately leaves Jicofo and JVB to discover our
+		// departure via idle timeout — minutes later — which is exactly
+		// the ghost-participant pattern that wedges back-to-back joins
+		// into the same conference.
+		//
+		// 5s matches lib-jitsi-meet's hardcoded leave timeout. On a
+		// healthy bridge this returns in tens of milliseconds; on a
+		// wedged one we still bail before the websocket teardown.
+		if err := s.Conn.LeaveMUCWait(s.room, 5*time.Second); err != nil {
+			// Fall back to fire-and-forget + short grace so we don't
+			// regress hard if the server is wedged.
+			_ = s.Conn.LeaveMUC(s.room)
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
 	return s.Conn.Close()
 }

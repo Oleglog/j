@@ -29,6 +29,17 @@ type Conn struct {
 	occupants map[string]struct{} // MUC nick → present (excluding self and "focus")
 	stanzas   chan string
 	closed    chan struct{}
+
+	// waitMu protects the per-stanza waiter maps below.
+	waitMu sync.Mutex
+	// iqWaiters resolves <iq type="result"/> or <iq type="error"/> back to
+	// the caller of SendIQWait via stanza id. The chan delivers the full
+	// stanza so the caller can inspect type/error payload.
+	iqWaiters map[string]chan string
+	// leaveWaiter fires when we observe our own presence-unavailable
+	// echoed back by Prosody — the XMPP equivalent of MUC_LEFT used in
+	// lib-jitsi-meet. Nil when no LeaveMUCWait is in flight.
+	leaveWaiter chan struct{}
 }
 
 type Service struct {
@@ -58,6 +69,7 @@ func Dial(ctx context.Context, host, room string, debug bool) (*Conn, error) {
 		occupants: make(map[string]struct{}),
 		stanzas:   make(chan string, 64),
 		closed:    make(chan struct{}),
+		iqWaiters: make(map[string]chan string),
 	}
 
 	if err := c.auth(ctx); err != nil {
@@ -136,9 +148,40 @@ func (c *Conn) readLoop() {
 		}
 		c.ackH.Add(1)
 
+		// Dispatch waiters before generic stanza fan-out. IQ result/error
+		// is the XMPP-level ack for SendIQWait callers; own presence
+		// unavailable echo is the MUC-level ack used by LeaveMUCWait. We
+		// resolve them here so callers don't need to scan the stanzas
+		// channel themselves.
+		if isIQResultOrError(msg) {
+			if id := extractXMLAttr(msg, "id"); id != "" {
+				c.waitMu.Lock()
+				if ch, ok := c.iqWaiters[id]; ok {
+					delete(c.iqWaiters, id)
+					c.waitMu.Unlock()
+					select {
+					case ch <- msg:
+					default:
+					}
+					continue
+				}
+				c.waitMu.Unlock()
+			}
+		}
+
 		// track MUC occupants from <presence> stanzas
 		if strings.HasPrefix(msg, "<presence") || strings.HasPrefix(msg, "<presence ") {
 			c.trackPresence(msg)
+			if c.isOwnPresenceUnavailable(msg) {
+				c.waitMu.Lock()
+				if w := c.leaveWaiter; w != nil {
+					c.leaveWaiter = nil
+					c.waitMu.Unlock()
+					close(w)
+				} else {
+					c.waitMu.Unlock()
+				}
+			}
 		}
 
 		// auto-reply to disco#info queries from Jicofo
@@ -455,6 +498,110 @@ func (c *Conn) LowerHand(room string) error {
 func (c *Conn) LeaveMUC(room string) error {
 	roomJID := fmt.Sprintf("%s@conference.%s/%s", room, c.host, c.nick)
 	return c.send(fmt.Sprintf(`<presence to="%s" type="unavailable" xmlns="jabber:client"/>`, roomJID))
+}
+
+// LeaveMUCWait sends MUC presence unavailable and waits for Prosody to echo
+// it back (the same handshake lib-jitsi-meet uses via XMPPEvents.MUC_LEFT).
+// Returning nil means the server has acknowledged our exit and routed it on
+// to Jicofo; the bridge slot can be reclaimed before this function returns.
+// Times out at the supplied deadline so a wedged server never hangs callers.
+func (c *Conn) LeaveMUCWait(room string, timeout time.Duration) error {
+	w := make(chan struct{})
+	c.waitMu.Lock()
+	// A second concurrent leave (shouldn't normally happen) just inherits
+	// the existing waiter; we don't try to chain them.
+	if c.leaveWaiter == nil {
+		c.leaveWaiter = w
+	} else {
+		w = c.leaveWaiter
+	}
+	c.waitMu.Unlock()
+
+	roomJID := fmt.Sprintf("%s@conference.%s/%s", room, c.host, c.nick)
+	if err := c.send(fmt.Sprintf(`<presence to="%s" type="unavailable" xmlns="jabber:client"/>`, roomJID)); err != nil {
+		c.waitMu.Lock()
+		if c.leaveWaiter == w {
+			c.leaveWaiter = nil
+		}
+		c.waitMu.Unlock()
+		return err
+	}
+
+	select {
+	case <-w:
+		return nil
+	case <-c.closed:
+		return fmt.Errorf("connection closed before MUC leave confirmed")
+	case <-time.After(timeout):
+		c.waitMu.Lock()
+		if c.leaveWaiter == w {
+			c.leaveWaiter = nil
+		}
+		c.waitMu.Unlock()
+		return fmt.Errorf("timeout waiting for MUC leave confirmation")
+	}
+}
+
+// SendIQWait sends an IQ and waits for a matching <iq type="result"/> or
+// <iq type="error"/> keyed by stanza id. Used for fire-and-confirm flows
+// like session-terminate where the caller needs to know the server has
+// accepted the request before continuing tear-down.
+func (c *Conn) SendIQWait(iqXML, id string, timeout time.Duration) (string, error) {
+	if id == "" {
+		return "", fmt.Errorf("SendIQWait requires non-empty id")
+	}
+	ch := make(chan string, 1)
+	c.waitMu.Lock()
+	c.iqWaiters[id] = ch
+	c.waitMu.Unlock()
+
+	if err := c.send(iqXML); err != nil {
+		c.waitMu.Lock()
+		delete(c.iqWaiters, id)
+		c.waitMu.Unlock()
+		return "", err
+	}
+
+	select {
+	case reply := <-ch:
+		return reply, nil
+	case <-c.closed:
+		c.waitMu.Lock()
+		delete(c.iqWaiters, id)
+		c.waitMu.Unlock()
+		return "", fmt.Errorf("connection closed before IQ %s reply", id)
+	case <-time.After(timeout):
+		c.waitMu.Lock()
+		delete(c.iqWaiters, id)
+		c.waitMu.Unlock()
+		return "", fmt.Errorf("timeout waiting for IQ %s reply", id)
+	}
+}
+
+// isIQResultOrError tells whether a stanza is an IQ acknowledging an earlier
+// IQ we sent. Used in the read loop to dispatch SendIQWait callers.
+func isIQResultOrError(msg string) bool {
+	if !strings.HasPrefix(msg, "<iq") {
+		return false
+	}
+	// type attribute is small and appears near the front of the iq element
+	t := extractXMLAttr(msg, "type")
+	return t == "result" || t == "error"
+}
+
+// isOwnPresenceUnavailable matches the broadcast Prosody sends back to us
+// when our MUC presence unavailable has been processed: from is our own
+// MUC JID with type="unavailable". This is what fires LeaveMUCWait.
+func (c *Conn) isOwnPresenceUnavailable(msg string) bool {
+	if !strings.Contains(msg, `type='unavailable'`) && !strings.Contains(msg, `type="unavailable"`) {
+		return false
+	}
+	from := extractXMLAttr(msg, "from")
+	if from == "" || c.nick == "" || c.room == "" {
+		return false
+	}
+	want := fmt.Sprintf("%s@conference.%s/%s", c.room, c.host, c.nick)
+	return from == want
 }
 
 func extractJID(s string) string {

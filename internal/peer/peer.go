@@ -319,6 +319,9 @@ func bumpSDPVersion(sdp string) string {
 }
 
 // Terminate sends session-terminate to gracefully end the Jingle session.
+// Fire-and-forget; for graceful tear-down where you need to know Jicofo has
+// actually accepted the stanza before closing the websocket, prefer
+// TerminateWait.
 func (n *Negotiator) Terminate(reason string) error {
 	if err := n.ensureParsed(); err != nil {
 		return err
@@ -328,6 +331,28 @@ func (n *Negotiator) Terminate(reason string) error {
 	}
 	inner := fmt.Sprintf(`<reason><%s/></reason>`, reason)
 	return n.XMPP.SendJingle(n.RoomJID+"/focus", "session-terminate", n.parsed.SID, n.parsed.Initiator, inner)
+}
+
+// TerminateWait is like Terminate but waits for Jicofo's <iq type="result"/>
+// (or error) before returning. This matches lib-jitsi-meet's JingleSessionPC
+// terminate path which uses sendIQ with a callback rather than a one-shot
+// send. Waiting matters because the websocket teardown that usually follows
+// would otherwise race the round-trip and Jicofo would only free the bridge
+// slot after its idle timeout — exactly the "ghost participant" symptom we
+// hit on back-to-back reconnects to the same MUC.
+func (n *Negotiator) TerminateWait(reason string, timeout time.Duration) error {
+	if err := n.ensureParsed(); err != nil {
+		return err
+	}
+	if reason == "" {
+		reason = "success"
+	}
+	id := n.XMPP.NextID()
+	iq := fmt.Sprintf(
+		`<iq to="%s" type="set" id="%s" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="session-terminate" sid="%s" initiator="%s" responder="%s"><reason><%s/></reason></jingle></iq>`,
+		n.RoomJID+"/focus", id, n.parsed.SID, n.parsed.Initiator, n.XMPP.JID(), reason)
+	_, err := n.XMPP.SendIQWait(iq, id, timeout)
+	return err
 }
 
 // buildJingleCandidateXML converts an SDP candidate line to <candidate .../>

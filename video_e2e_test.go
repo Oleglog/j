@@ -14,8 +14,7 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 )
 
-// TestE2EVideoFakePayload: 3 bots. bot2 sends VP8 (valid then fake), bot3 receives.
-// After Accept, bot2 sends source-add so Jicofo tells bot3 about the new SSRC.
+// TestE2EVideoFakePayload: symmetric — bot2 and bot3 both send AND receive video from each other.
 func TestE2EVideoFakePayload(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -23,185 +22,201 @@ func TestE2EVideoFakePayload(t *testing.T) {
 	room := "j-fake-vp8-test"
 	host := "meet.cryptopro.ru"
 
-	// Bot 1: filler
+	// Bot 1: filler (needed for Jicofo to create conference)
 	bot1, err := JoinMUC(ctx, Config{Host: host, Room: room, Nick: "bot1-filler"})
 	if err != nil {
 		t.Fatalf("bot1: %v", err)
 	}
 	defer bot1.Close()
 
-	// Bot 2: sender
-	t.Log("bot2: joining (sender)...")
-	bot2, err := Join(ctx, Config{Host: host, Room: room, Nick: "bot2-sender"})
-	if err != nil {
-		t.Fatalf("bot2: %v", err)
-	}
-	defer bot2.Close()
-
-	pc2, err := webrtc.NewPeerConnection(bot2.IceConfig())
-	if err != nil {
-		t.Fatalf("pc2: %v", err)
-	}
-	defer pc2.Close()
-
-	sendTrack, _ := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
-		"fakevideo", "fakestream")
-	pc2.AddTrack(sendTrack)
-
-	neg2 := bot2.Negotiator()
-	neg2.PC = pc2
-	if err := neg2.Accept(ctx); err != nil {
-		t.Fatalf("bot2 Accept: %v", err)
-	}
-	defer neg2.Terminate("success")
-
-	// Send source-add to announce our SSRC to Jicofo
-	localSDP := pc2.LocalDescription().SDP
-	if err := neg2.SendSourceAddFromSDP(localSDP); err != nil {
-		t.Logf("bot2 source-add: %v (may be ok if already in session-accept)", err)
-	} else {
-		t.Log("bot2: source-add sent")
-	}
-
-	waitPC(t, pc2, 15*time.Second)
-	t.Log("bot2: connected")
-
-	// Start sending VALID VP8 keyframes first
-	t.Log("bot2: sending valid VP8 keyframes...")
 	validFrame := dummyVP8KeyframeLarge()
-	sendCtx, sendCancel := context.WithCancel(ctx)
-	defer sendCancel()
-	var totalSent atomic.Int64
 	var sendingFake atomic.Bool
-	go func() {
-		tick := time.NewTicker(33 * time.Millisecond)
-		defer tick.Stop()
-		for {
-			select {
-			case <-sendCtx.Done():
-				return
-			case <-tick.C:
-				var frame []byte
-				if sendingFake.Load() {
-					// Fake: valid header + garbage
-					frame = make([]byte, 1024)
-					copy(frame, validFrame[:10])
-					rand.Read(frame[10:])
-				} else {
-					frame = validFrame
-				}
-				sendTrack.WriteSample(media.Sample{Data: frame, Duration: 33 * time.Millisecond})
-				totalSent.Add(1)
-			}
+
+	// Helper: create a bot that sends video and receives video from the other
+	type botResult struct {
+		rxValidPkts, rxFakePkts   atomic.Int64
+		rxValidBytes, rxFakeBytes atomic.Int64
+		totalSent                 atomic.Int64
+		trackReceived             chan struct{}
+	}
+
+	setupBot := func(name string, planB bool) (*Session, *webrtc.PeerConnection, *botResult) {
+		t.Logf("%s: joining...", name)
+		bot, err := Join(ctx, Config{Host: host, Room: room, Nick: name})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
 		}
-	}()
 
-	// Bot 3: receiver — join AFTER bot2 is already sending
-	time.Sleep(2 * time.Second) // let bot2 establish itself
-	t.Log("bot3: joining (receiver)...")
-	bot3, err := Join(ctx, Config{Host: host, Room: room, Nick: "bot3-receiver"})
-	if err != nil {
-		t.Fatalf("bot3: %v", err)
-	}
-	defer bot3.Close()
+		cfg := bot.IceConfig()
+		if planB {
+			cfg.SDPSemantics = webrtc.SDPSemanticsPlanB
+		}
+		pc, err := webrtc.NewPeerConnection(cfg)
+		if err != nil {
+			t.Fatalf("%s pc: %v", name, err)
+		}
 
-	// Jicofo sends Plan B offer when there are existing video sources in the room
-	cfg3 := bot3.IceConfig()
-	cfg3.SDPSemantics = webrtc.SDPSemanticsPlanB
-	pc3, err := webrtc.NewPeerConnection(cfg3)
-	if err != nil {
-		t.Fatalf("pc3: %v", err)
-	}
-	defer pc3.Close()
+		// Send track
+		track, _ := webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
+			"video-"+name, "stream-"+name)
+		pc.AddTrack(track)
 
-	pc3.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly})
-	pc3.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly})
+		res := &botResult{trackReceived: make(chan struct{}, 1)}
 
-	var rxValidPkts atomic.Int64
-	var rxFakePkts atomic.Int64
-	var rxValidBytes atomic.Int64
-	var rxFakeBytes atomic.Int64
-	trackReceived := make(chan struct{}, 1)
-
-	pc3.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		t.Logf("[rx] OnTrack: kind=%s codec=%s ssrc=%d", track.Kind(), track.Codec().MimeType, track.SSRC())
-		if track.Kind() == webrtc.RTPCodecTypeVideo {
+		// Receive track
+		pc.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+			t.Logf("[%s rx] OnTrack: kind=%s codec=%s ssrc=%d", name, remote.Kind(), remote.Codec().MimeType, remote.SSRC())
+			if remote.Kind() != webrtc.RTPCodecTypeVideo {
+				return
+			}
 			select {
-			case trackReceived <- struct{}{}:
+			case res.trackReceived <- struct{}{}:
 			default:
 			}
 			buf := make([]byte, 1500)
 			for {
-				n, _, err := track.Read(buf)
+				n, _, err := remote.Read(buf)
 				if err != nil {
 					return
 				}
 				if sendingFake.Load() {
-					rxFakePkts.Add(1)
-					rxFakeBytes.Add(int64(n))
+					res.rxFakePkts.Add(1)
+					res.rxFakeBytes.Add(int64(n))
 				} else {
-					rxValidPkts.Add(1)
-					rxValidBytes.Add(int64(n))
+					res.rxValidPkts.Add(1)
+					res.rxValidBytes.Add(int64(n))
 				}
 			}
+		})
+
+		neg := bot.Negotiator()
+		neg.PC = pc
+		if err := neg.Accept(ctx); err != nil {
+			t.Fatalf("%s Accept: %v", name, err)
 		}
-	})
 
-	neg3 := bot3.Negotiator()
-	neg3.PC = pc3
-	if err := neg3.Accept(ctx); err != nil {
-		t.Fatalf("bot3 Accept: %v", err)
+		if err := neg.SendSourceAddFromSDP(pc.LocalDescription().SDP); err != nil {
+			t.Logf("%s source-add: %v", name, err)
+		} else {
+			t.Logf("%s: source-add sent", name)
+		}
+
+		// Listen for incoming source-add from Jicofo and update remote SDP
+		go func() {
+			for {
+				select {
+				case stanza, ok := <-bot.Conn.Stanzas():
+					if !ok {
+						return
+					}
+					if strings.Contains(stanza, "source-add") {
+						if err := neg.HandleSourceAdd(stanza); err != nil {
+							t.Logf("%s: handle source-add: %v", name, err)
+						} else {
+							t.Logf("%s: handled incoming source-add", name)
+						}
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+
+		waitPC(t, pc, 15*time.Second)
+		t.Logf("%s: connected", name)
+
+		// Start sending frames
+		go func() {
+			tick := time.NewTicker(33 * time.Millisecond)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					var frame []byte
+					if sendingFake.Load() {
+						frame = make([]byte, 1024)
+						copy(frame, validFrame[:10])
+						rand.Read(frame[10:])
+					} else {
+						frame = validFrame
+					}
+					track.WriteSample(media.Sample{Data: frame, Duration: 33 * time.Millisecond})
+					res.totalSent.Add(1)
+				}
+			}
+		}()
+
+		// Open bridge and request video
+		if err := bot.OpenBridge(ctx); err != nil {
+			t.Fatalf("%s OpenBridge: %v", name, err)
+		}
+		bot.Bridge().SendJSON(map[string]any{
+			"colibriClass":       "ReceiverVideoConstraints",
+			"lastN":              -1,
+			"defaultConstraints": map[string]any{"maxHeight": 720},
+		})
+
+		return bot, pc, res
 	}
-	defer neg3.Terminate("success")
 
-	waitPC(t, pc3, 15*time.Second)
-	t.Log("bot3: connected")
+	bot2, pc2, res2 := setupBot("bot2", true)
+	defer bot2.Close()
+	defer pc2.Close()
 
-	// Open bridge channel and request video via ReceiverVideoConstraints
-	if err := bot3.OpenBridge(ctx); err != nil {
-		t.Fatalf("bot3 OpenBridge: %v", err)
+	time.Sleep(2 * time.Second) // let bot2 establish
+
+	bot3, pc3, res3 := setupBot("bot3", true)
+	defer bot3.Close()
+	defer pc3.Close()
+
+	// Wait for both to receive video tracks
+	for _, pair := range []struct {
+		name string
+		res  *botResult
+	}{{"bot2", res2}, {"bot3", res3}} {
+		select {
+		case <-pair.res.trackReceived:
+			t.Logf("%s: got video track!", pair.name)
+		case <-time.After(20 * time.Second):
+			t.Fatalf("FAIL: %s never received video track", pair.name)
+		}
 	}
-	bot3.Bridge().SendJSON(map[string]any{
-		"colibriClass":       "ReceiverVideoConstraints",
-		"lastN":              -1,
-		"defaultConstraints": map[string]any{"maxHeight": 720},
-	})
-	t.Log("bot3: sent ReceiverVideoConstraints, waiting for video track...")
 
-	select {
-	case <-trackReceived:
-		t.Log("bot3: got video track!")
-	case <-time.After(20 * time.Second):
-		t.Fatal("FAIL: bot3 never received video track (OnTrack not fired)")
-	}
-
-	// Collect valid VP8 stats for 3 seconds
+	// Collect valid VP8 stats
 	time.Sleep(3 * time.Second)
-	validPkts := rxValidPkts.Load()
-	validBytes := rxValidBytes.Load()
-	t.Logf("VALID VP8: received %d packets (%d bytes)", validPkts, validBytes)
-
-	if validPkts == 0 {
-		t.Fatal("FAIL: even valid VP8 not received — video routing broken")
+	for _, pair := range []struct {
+		name string
+		res  *botResult
+	}{{"bot2", res2}, {"bot3", res3}} {
+		v := pair.res.rxValidPkts.Load()
+		t.Logf("%s VALID VP8: received %d packets (%d bytes)", pair.name, v, pair.res.rxValidBytes.Load())
+		if v == 0 {
+			t.Fatalf("FAIL: %s received no valid VP8 — video routing broken", pair.name)
+		}
 	}
 
-	// Now switch to fake payload
+	// Switch to fake payload
 	t.Log("switching to FAKE VP8 (valid header + random garbage)...")
 	sendingFake.Store(true)
 	time.Sleep(5 * time.Second)
 
-	fakePkts := rxFakePkts.Load()
-	fakeBytes := rxFakeBytes.Load()
-	t.Logf("FAKE VP8: received %d packets (%d bytes)", fakePkts, fakeBytes)
-
-	if fakePkts == 0 {
-		t.Error("FAIL: bridge dropped fake VP8 frames — it inspects payload!")
-	} else {
-		t.Logf("SUCCESS: bridge routed %d fake packets (%d bytes) — arbitrary data works!", fakePkts, fakeBytes)
+	for _, pair := range []struct {
+		name string
+		res  *botResult
+	}{{"bot2", res2}, {"bot3", res3}} {
+		f := pair.res.rxFakePkts.Load()
+		t.Logf("%s FAKE VP8: received %d packets (%d bytes)", pair.name, f, pair.res.rxFakeBytes.Load())
+		if f == 0 {
+			t.Errorf("FAIL: %s — bridge dropped fake VP8 frames", pair.name)
+		} else {
+			t.Logf("SUCCESS: %s received %d fake packets — arbitrary data works!", pair.name, f)
+		}
 	}
 
-	t.Logf("SUMMARY: valid=%d pkts, fake=%d pkts, total_sent=%d frames", validPkts, fakePkts, totalSent.Load())
+	t.Logf("SUMMARY: bot2 sent=%d, bot3 sent=%d", res2.totalSent.Load(), res3.totalSent.Load())
 }
 
 // dummyVP8KeyframeLarge returns a more realistic VP8 keyframe (~200 bytes).

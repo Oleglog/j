@@ -199,6 +199,125 @@ func (n *Negotiator) SendSourceRemove(sourcesXML string) error {
 	return n.XMPP.SendJingle(n.RoomJID+"/focus", "source-remove", n.parsed.SID, n.parsed.Initiator, sourcesXML)
 }
 
+// HandleSourceAdd processes an incoming source-add stanza from Jicofo.
+// It extracts the new SSRCs and updates the remote SDP so pion can accept incoming RTP.
+func (n *Negotiator) HandleSourceAdd(stanza string) error {
+	jng, err := jingle.ParseStanza(stanza)
+	if err != nil {
+		return fmt.Errorf("peer: parse source-add: %w", err)
+	}
+
+	// Get current remote description
+	rd := n.PC.RemoteDescription()
+	if rd == nil {
+		return fmt.Errorf("peer: no remote description set")
+	}
+
+	// For each content in source-add, append SSRC lines to the matching m= section
+	sdp := rd.SDP
+	for _, content := range jng.Contents {
+		if content.Description == nil {
+			continue
+		}
+		media := content.Description.Media
+		if media == "" {
+			media = content.Name
+		}
+
+		var ssrcLines strings.Builder
+		for _, sg := range content.Description.SSRCGroups {
+			var ssrcs []string
+			for _, s := range sg.Sources {
+				ssrcs = append(ssrcs, s.SSRC)
+			}
+			fmt.Fprintf(&ssrcLines, "a=ssrc-group:%s %s\r\n", sg.Semantics, strings.Join(ssrcs, " "))
+		}
+		for _, src := range content.Description.Sources {
+			for _, p := range src.Parameters {
+				if p.Name == "" {
+					fmt.Fprintf(&ssrcLines, "a=ssrc:%s %s\r\n", src.SSRC, p.Value)
+				} else if p.Value == "" {
+					fmt.Fprintf(&ssrcLines, "a=ssrc:%s %s\r\n", src.SSRC, p.Name)
+				} else {
+					fmt.Fprintf(&ssrcLines, "a=ssrc:%s %s:%s\r\n", src.SSRC, p.Name, p.Value)
+				}
+			}
+			if len(src.Parameters) == 0 {
+				fmt.Fprintf(&ssrcLines, "a=ssrc:%s cname:source-add-%s\r\n", src.SSRC, src.SSRC)
+			}
+		}
+
+		if ssrcLines.Len() == 0 {
+			continue
+		}
+
+		sdp = insertSSRCIntoSection(sdp, media, ssrcLines.String())
+	}
+
+	if sdp == rd.SDP {
+		return nil // nothing changed
+	}
+
+	// Increment o= version to make pion accept the new offer
+	sdp = bumpSDPVersion(sdp)
+
+	if err := n.PC.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP:  sdp,
+	}); err != nil {
+		return fmt.Errorf("peer: set remote desc after source-add: %w", err)
+	}
+
+	answer, err := n.PC.CreateAnswer(nil)
+	if err != nil {
+		return fmt.Errorf("peer: create answer after source-add: %w", err)
+	}
+	return n.PC.SetLocalDescription(answer)
+}
+
+// insertSSRCIntoSection appends ssrcLines at the end of the m=<mediaType> section.
+func insertSSRCIntoSection(sdp, mediaType, ssrcLines string) string {
+	marker := "m=" + mediaType
+	idx := strings.Index(sdp, marker)
+	if idx == -1 {
+		return sdp
+	}
+	// Find end of this m= section (next m= or end of string)
+	rest := sdp[idx+len(marker):]
+	nextM := strings.Index(rest, "\r\nm=")
+	var insertPos int
+	if nextM == -1 {
+		// Last section — insert before trailing \r\n if any
+		insertPos = len(sdp)
+		if strings.HasSuffix(sdp, "\r\n") {
+			insertPos -= 2
+		}
+	} else {
+		insertPos = idx + len(marker) + nextM + 2 // after the \r\n before next m=
+	}
+	return sdp[:insertPos] + ssrcLines + sdp[insertPos:]
+}
+
+// bumpSDPVersion increments the session version in the o= line.
+func bumpSDPVersion(sdp string) string {
+	// o=- 0 2 IN IP4 0.0.0.0 -> increment the version number (second number)
+	lines := strings.Split(sdp, "\r\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "o=") {
+			parts := strings.Fields(line)
+			if len(parts) >= 4 {
+				// parts[2] is the session version
+				ver := 0
+				fmt.Sscanf(parts[2], "%d", &ver)
+				parts[2] = fmt.Sprintf("%d", ver+1)
+				lines[i] = strings.Join(parts, " ")
+			}
+			break
+		}
+	}
+	return strings.Join(lines, "\r\n")
+}
+
 // Terminate sends session-terminate to gracefully end the Jingle session.
 func (n *Negotiator) Terminate(reason string) error {
 	if err := n.ensureParsed(); err != nil {

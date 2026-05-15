@@ -339,12 +339,12 @@ func JoinMUC(ctx context.Context, cfg Config) (*Session, error) {
 	}
 
 	if err := conn.AllocateFocus(cfg.Room); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("allocate focus: %w", err)
 	}
 
 	if err := conn.JoinMUC(cfg.Room, cfg.Nick); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("join muc: %w", err)
 	}
 
@@ -371,23 +371,23 @@ func Join(ctx context.Context, cfg Config) (*Session, error) {
 
 	services, err := conn.DiscoverServices()
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("discover services: %w", err)
 	}
 
 	if err := conn.AllocateFocus(cfg.Room); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("allocate focus: %w", err)
 	}
 
 	if err := conn.JoinMUC(cfg.Room, cfg.Nick); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("join muc: %w", err)
 	}
 
 	ji, err := conn.WaitJingle(ctx)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("wait jingle: %w", err)
 	}
 

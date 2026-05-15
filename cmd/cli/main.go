@@ -69,7 +69,7 @@ func runChat(ctx context.Context, host, room, nick string, debug bool) {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	defer sess.Close()
+	defer func() { _ = sess.Close() }()
 
 	fmt.Fprintf(os.Stderr, "joined! type messages (/raise, /lower, /quit):\n")
 
@@ -123,7 +123,7 @@ func runJingle(ctx context.Context, host, room, nick string, debug bool, timeout
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	defer sess.Close()
+	defer func() { _ = sess.Close() }()
 
 	out := map[string]any{
 		"jid":          sess.JID,
@@ -139,7 +139,7 @@ func runJingle(ctx context.Context, host, room, nick string, debug bool, timeout
 
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
-	enc.Encode(out)
+	_ = enc.Encode(out)
 }
 
 // runDC: text broadcast over bridge channel. Each line of stdin → EndpointMessage{text:line}.
@@ -153,7 +153,7 @@ func runDC(ctx context.Context, host, room, nick string, debug bool, timeout tim
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	defer sess.Close()
+	defer func() { _ = sess.Close() }()
 
 	if err := sess.OpenBridge(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "open bridge: %v\n", err)
@@ -200,7 +200,7 @@ func runDCRaw(ctx context.Context, host, room, nick string, debug bool, timeout 
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	defer sess.Close()
+	defer func() { _ = sess.Close() }()
 
 	if err := sess.OpenBridge(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "open bridge: %v\n", err)
@@ -213,7 +213,7 @@ func runDCRaw(ctx context.Context, host, room, nick string, debug bool, timeout 
 	go func() {
 		for m := range sess.BridgeMessages() {
 			if raw := colibri.DecodeRaw(m); raw != nil {
-				os.Stdout.Write(raw)
+				_, _ = os.Stdout.Write(raw)
 				continue
 			}
 			if m.Class != "EndpointMessage" {
@@ -253,7 +253,7 @@ func runMedia(ctx context.Context, host, room, nick string, debug bool, timeout 
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	defer sess.Close()
+	defer func() { _ = sess.Close() }()
 
 	for round := 1; ; round++ {
 		fmt.Fprintf(os.Stderr, "=== media round %d ===\n", round)
@@ -281,7 +281,7 @@ func acceptOnce(ctx context.Context, sess *j.Session, sendVideo bool) error {
 	if err != nil {
 		return fmt.Errorf("new pc: %w", err)
 	}
-	defer pc.Close()
+	defer func() { _ = pc.Close() }()
 
 	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
 		fmt.Fprintf(os.Stderr, "add audio recvonly: %v\n", err)
@@ -341,14 +341,14 @@ func acceptOnce(ctx context.Context, sess *j.Session, sendVideo bool) error {
 	if err := neg.Accept(ctx); err != nil {
 		if peer.IsPlanBError(err) {
 			fmt.Fprintln(os.Stderr, "detected Plan B offer, recreating PC with PlanB semantics...")
-			pc.Close()
+			_ = pc.Close()
 			cfg := sess.IceConfig()
 			cfg.SDPSemantics = webrtc.SDPSemanticsPlanB
 			pc, err = webrtc.NewPeerConnection(cfg)
 			if err != nil {
 				return fmt.Errorf("new pc (planb): %w", err)
 			}
-			defer pc.Close()
+			defer func() { _ = pc.Close() }()
 			if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
 				fmt.Fprintf(os.Stderr, "add audio recvonly: %v\n", err)
 			}
@@ -356,9 +356,9 @@ func acceptOnce(ctx context.Context, sess *j.Session, sendVideo bool) error {
 				localVideo, _ = webrtc.NewTrackLocalStaticSample(
 					webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
 					"jvideo", "jstream")
-				pc.AddTrack(localVideo)
+				pc.AddTrack(localVideo) //nolint:errcheck
 			} else {
-				pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly})
+				pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}) //nolint:errcheck
 			}
 			pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 				fmt.Fprintf(os.Stderr, "[track] kind=%s id=%s codec=%s ssrc=%d\n",
@@ -454,7 +454,7 @@ func runBench(ctx context.Context, host, room, nick string, debug bool, timeout 
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	defer sess.Close()
+	defer func() { _ = sess.Close() }()
 	if err := sess.OpenBridge(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "open bridge: %v\n", err)
 		os.Exit(1)
@@ -536,7 +536,7 @@ func runBenchXMPP(ctx context.Context, host, room, nick string, debug bool, payl
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	defer sess.Close()
+	defer func() { _ = sess.Close() }()
 
 	fmt.Fprintf(os.Stderr, "bench-xmpp: payload=%dB duration=%ds\n", payloadSize, secs)
 

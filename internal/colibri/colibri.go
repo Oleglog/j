@@ -66,7 +66,7 @@ func Dial(ctx context.Context, url string) (*Conn, error) {
 	go c.writeLoop()
 	// send ClientHello as required by the protocol
 	if err := c.SendJSON(map[string]any{"colibriClass": "ClientHello"}); err != nil {
-		ws.Close(websocket.StatusInternalError, "")
+		_ = ws.Close(websocket.StatusInternalError, "")
 		return nil, fmt.Errorf("client hello: %w", err)
 	}
 	go c.readLoop()

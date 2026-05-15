@@ -218,7 +218,7 @@ func TestPeerConnectionCanAddVideoTrack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new pc: %v", err)
 	}
-	defer pc.Close()
+	defer func() { _ = pc.Close() }()
 
 	track, _ := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
@@ -257,7 +257,7 @@ func TestSetRemoteDescriptionWithVideoOffer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new pc: %v", err)
 	}
-	defer pc.Close()
+	defer func() { _ = pc.Close() }()
 
 	// Add recvonly video transceiver (as our client does)
 	_, err = pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo,
@@ -291,7 +291,7 @@ func TestSetRemoteDescriptionWithSendVideo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new pc: %v", err)
 	}
-	defer pc.Close()
+	defer func() { _ = pc.Close() }()
 
 	// Add sendonly video track (as -send-video does)
 	track, _ := webrtc.NewTrackLocalStaticSample(
@@ -333,11 +333,7 @@ func containsLine(s, substr string) bool {
 }
 
 func splitLines(s string) []string {
-	var lines []string
-	for _, l := range splitByNewline(s) {
-		lines = append(lines, l)
-	}
-	return lines
+	return splitByNewline(s)
 }
 
 func splitByNewline(s string) []string {

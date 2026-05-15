@@ -61,7 +61,7 @@ func Dial(ctx context.Context, host, room string, debug bool) (*Conn, error) {
 	}
 
 	if err := c.auth(ctx); err != nil {
-		ws.Close(websocket.StatusInternalError, "")
+		_ = ws.Close(websocket.StatusInternalError, "")
 		return nil, err
 	}
 
@@ -128,7 +128,7 @@ func (c *Conn) readLoop() {
 		}
 		// handle stream management
 		if strings.Contains(msg, "<r ") || strings.Contains(msg, "<r/>") || strings.Contains(msg, "<r xmlns") {
-			c.send(fmt.Sprintf(`<a h="%d" xmlns="urn:xmpp:sm:3"/>`, c.ackH.Load()))
+			_ = c.send(fmt.Sprintf(`<a h="%d" xmlns="urn:xmpp:sm:3"/>`, c.ackH.Load()))
 			continue
 		}
 		if strings.HasPrefix(msg, "<a ") || strings.Contains(msg, "<a xmlns=\"urn:xmpp:sm:3\"") || strings.Contains(msg, "<a xmlns='urn:xmpp:sm:3'") {
@@ -204,7 +204,7 @@ func (c *Conn) handleDiscoQuery(msg string) {
 		return
 	}
 	resp := fmt.Sprintf(`<iq to="%s" id="%s" type="result" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:dtls-sctp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="http://jitsi.org/protocol/colibri2"/></query></iq>`, from, id)
-	c.send(resp)
+	_ = c.send(resp)
 }
 
 func extractXMLAttr(s, attr string) string {
@@ -487,24 +487,17 @@ func parseServices(s string) []Service {
 	}
 
 	var iq xmlIQ
-	xml.Unmarshal([]byte(s), &iq)
+	_ = xml.Unmarshal([]byte(s), &iq)
 
 	var result []Service
 	for _, svc := range iq.Services.Services {
-		result = append(result, Service{
-			Type:      svc.Type,
-			Host:      svc.Host,
-			Port:      svc.Port,
-			Transport: svc.Transport,
-			Username:  svc.Username,
-			Password:  svc.Password,
-		})
+		result = append(result, Service(svc))
 	}
 	return result
 }
 
 func xmlEscape(s string) string {
 	var b strings.Builder
-	xml.EscapeText(&b, []byte(s))
+	_ = xml.EscapeText(&b, []byte(s))
 	return b.String()
 }

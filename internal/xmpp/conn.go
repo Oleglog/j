@@ -598,6 +598,16 @@ func (c *Conn) SendJingle(to, action, sid, initiator string, innerXML string) er
 	return c.send(iq)
 }
 
+// SendJingleWait sends a Jingle IQ and waits until the recipient acknowledges
+// it with a matching <iq type="result"/> or <iq type="error"/>.
+func (c *Conn) SendJingleWait(to, action, sid, initiator string, innerXML string, timeout time.Duration) (string, error) {
+	id := c.NextID()
+	iq := fmt.Sprintf(
+		`<iq to="%s" type="set" id="%s" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="%s" sid="%s" initiator="%s" responder="%s">%s</jingle></iq>`,
+		to, id, action, sid, initiator, c.jid, innerXML)
+	return c.SendIQWait(iq, id, timeout)
+}
+
 func (c *Conn) SendGroupchat(roomJID, body string) error {
 	msg := fmt.Sprintf(`<message to="%s" type="groupchat" xmlns="jabber:client"><body>%s</body></message>`, roomJID, xmlEscape(body))
 	return c.send(msg)

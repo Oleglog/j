@@ -14,13 +14,15 @@ import (
 	"github.com/zarazaex69/j/internal/xmpp"
 )
 
+const sourceAddAckTimeout = 5 * time.Second
+
 // Negotiator handles a single Jingle session against Jicofo using a pion PeerConnection.
 type Negotiator struct {
-	XMPP        *xmpp.Conn
-	JingleStanza string             // raw <iq…><jingle action="session-initiate"…>…</jingle></iq>
-	RoomJID     string              // <room>@conference.<host>
-	PC          *webrtc.PeerConnection
-	OnRemote    func(track *webrtc.TrackRemote, recv *webrtc.RTPReceiver) // optional
+	XMPP                       *xmpp.Conn
+	JingleStanza               string // raw <iq…><jingle action="session-initiate"…>…</jingle></iq>
+	RoomJID                    string // <room>@conference.<host>
+	PC                         *webrtc.PeerConnection
+	OnRemote                   func(track *webrtc.TrackRemote, recv *webrtc.RTPReceiver) // optional
 	OnIceConnectionStateChange func(webrtc.ICEConnectionState)
 
 	parsed *jingle.XMLJingle
@@ -73,6 +75,7 @@ func (n *Negotiator) Accept(ctx context.Context) error {
 	}
 
 	offerSDP := jingle.JingleToSDP(n.parsed)
+	pionOfferSDP := stripRemoteSourcesForPion(offerSDP)
 
 	// Detect Plan B: if a single m=video section contains multiple SSRCs from
 	// different sources, pion's UnifiedPlan will reject it. Detect and error
@@ -81,7 +84,7 @@ func (n *Negotiator) Accept(ctx context.Context) error {
 		// Try setting with current PC — if it fails, return a typed error
 		err := n.PC.SetRemoteDescription(webrtc.SessionDescription{
 			Type: webrtc.SDPTypeOffer,
-			SDP:  offerSDP,
+			SDP:  pionOfferSDP,
 		})
 		if err != nil && strings.Contains(err.Error(), "PlanB") {
 			return fmt.Errorf("peer: remote SDP is Plan B — recreate PeerConnection with webrtc.SDPSemanticsPlanB: %w", err)
@@ -92,7 +95,7 @@ func (n *Negotiator) Accept(ctx context.Context) error {
 	} else {
 		if err := n.PC.SetRemoteDescription(webrtc.SessionDescription{
 			Type: webrtc.SDPTypeOffer,
-			SDP:  offerSDP,
+			SDP:  pionOfferSDP,
 		}); err != nil {
 			return fmt.Errorf("set remote desc: %w", err)
 		}
@@ -174,7 +177,15 @@ func (n *Negotiator) SendSourceAdd(sourcesXML string) error {
 	if err := n.ensureParsed(); err != nil {
 		return err
 	}
-	return n.XMPP.SendJingle(n.RoomJID+"/focus", "source-add", n.parsed.SID, n.parsed.Initiator, sourcesXML)
+	_, err := n.XMPP.SendJingleWait(
+		n.RoomJID+"/focus",
+		"source-add",
+		n.parsed.SID,
+		n.parsed.Initiator,
+		sourcesXML,
+		sourceAddAckTimeout,
+	)
+	return err
 }
 
 // SendSourceAddFromSDP convenience: extracts <source>/<ssrc-group> elements per content
@@ -211,6 +222,9 @@ func (n *Negotiator) HandleSourceAdd(stanza string) error {
 	rd := n.PC.RemoteDescription()
 	if rd == nil {
 		return fmt.Errorf("peer: no remote description set")
+	}
+	if !sdpHasExplicitSources(rd.SDP) {
+		return nil
 	}
 
 	// For each content in source-add, append SSRC lines to the matching m= section
@@ -316,6 +330,32 @@ func bumpSDPVersion(sdp string) string {
 		}
 	}
 	return strings.Join(lines, "\r\n")
+}
+
+// stripRemoteSourcesForPion removes remote SSRC attributes before handing the
+// offer to pion. Jitsi/JVB can forward RTP for a newly announced source before
+// the matching source-add stanza has been applied locally; if the m-section
+// contains any explicit SSRC, pion drops that RTP and never fires OnTrack.
+// Leaving the media section source-less lets pion bind tracks dynamically.
+func stripRemoteSourcesForPion(sdp string) string {
+	lines := strings.Split(sdp, "\r\n")
+	out := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(line, "a=ssrc:") || strings.HasPrefix(line, "a=ssrc-group:") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\r\n")
+}
+
+func sdpHasExplicitSources(sdp string) bool {
+	for _, line := range strings.Split(sdp, "\r\n") {
+		if strings.HasPrefix(line, "a=ssrc:") || strings.HasPrefix(line, "a=ssrc-group:") {
+			return true
+		}
+	}
+	return false
 }
 
 // Terminate sends session-terminate to gracefully end the Jingle session.

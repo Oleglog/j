@@ -102,22 +102,22 @@ func unescapeXML(s string) string {
 }
 
 type Session struct {
-	JID          string
-	RoomJID      string
-	SDP          string // remote SDP offer
-	ICEServers   []ICEServer
-	Candidates   []jingle.Candidate
-	DataChannel  *jingle.DataChannel
-	AudioSSRC    []jingle.Source
-	VideoSSRC    []jingle.Source
-	ColibriWS    string // bridge WebSocket URL — use for sending EndpointMessage to other participants
-	Conn         *xmpp.Conn
+	JID         string
+	RoomJID     string
+	SDP         string // remote SDP offer
+	ICEServers  []ICEServer
+	Candidates  []jingle.Candidate
+	DataChannel *jingle.DataChannel
+	AudioSSRC   []jingle.Source
+	VideoSSRC   []jingle.Source
+	ColibriWS   string // bridge WebSocket URL — use for sending EndpointMessage to other participants
+	Conn        *xmpp.Conn
 
-	bridge       *colibri.Conn
-	bridgeMu     sync.Mutex
-	room         string
-	jingleSID    string
-	initiator    string
+	bridge    *colibri.Conn
+	bridgeMu  sync.Mutex
+	room      string
+	jingleSID string
+	initiator string
 }
 
 // BridgeMessage is the type returned by the Bridge() channel — see internal/colibri.Message.
@@ -359,12 +359,12 @@ func JoinMUC(ctx context.Context, cfg Config) (*Session, error) {
 		return nil, fmt.Errorf("xmpp dial: %w", err)
 	}
 
-	if err := conn.AllocateFocus(cfg.Room); err != nil {
+	if err := conn.AllocateFocus(ctx, cfg.Room); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("allocate focus: %w", err)
 	}
 
-	if err := conn.JoinMUC(cfg.Room, cfg.Nick); err != nil {
+	if err := conn.JoinMUC(ctx, cfg.Room, cfg.Nick); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("join muc: %w", err)
 	}
@@ -390,18 +390,18 @@ func Join(ctx context.Context, cfg Config) (*Session, error) {
 		return nil, fmt.Errorf("xmpp dial: %w", err)
 	}
 
-	services, err := conn.DiscoverServices()
+	services, err := conn.DiscoverServices(ctx)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("discover services: %w", err)
 	}
 
-	if err := conn.AllocateFocus(cfg.Room); err != nil {
+	if err := conn.AllocateFocus(ctx, cfg.Room); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("allocate focus: %w", err)
 	}
 
-	if err := conn.JoinMUC(cfg.Room, cfg.Nick); err != nil {
+	if err := conn.JoinMUC(ctx, cfg.Room, cfg.Nick); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("join muc: %w", err)
 	}

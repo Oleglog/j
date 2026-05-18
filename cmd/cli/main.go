@@ -57,14 +57,17 @@ func main() {
 	case *dc:
 		runDC(ctx, *host, *room, *nick, *debug, *timeout)
 	case *chat:
-		runChat(ctx, *host, *room, *nick, *debug)
+		runChat(ctx, *host, *room, *nick, *debug, *timeout)
 	default:
 		runJingle(ctx, *host, *room, *nick, *debug, *timeout)
 	}
 }
 
-func runChat(ctx context.Context, host, room, nick string, debug bool) {
-	sess, err := j.JoinMUC(ctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
+func runChat(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration) {
+	jctx, jcancel := context.WithTimeout(ctx, timeout)
+	defer jcancel()
+
+	sess, err := j.JoinMUC(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -189,7 +192,8 @@ func runDC(ctx context.Context, host, room, nick string, debug bool, timeout tim
 }
 
 // runDCRaw: pipe arbitrary binary through the bridge.
-//   stdin (binary) → SendRaw broadcast → other endpoint receives → DecodeRaw → stdout
+//
+//	stdin (binary) → SendRaw broadcast → other endpoint receives → DecodeRaw → stdout
 func runDCRaw(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration) {
 	jctx, jcancel := context.WithTimeout(ctx, timeout)
 	defer jcancel()

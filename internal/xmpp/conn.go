@@ -2,9 +2,13 @@ package xmpp
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/xml"
 	"fmt"
+	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +32,7 @@ type Conn struct {
 	occMu     sync.Mutex
 	occupants map[string]struct{} // MUC nick → present (excluding self and "focus")
 	stanzas   chan string
+	jingles   chan string
 	closed    chan struct{}
 	closeOnce sync.Once
 
@@ -58,10 +63,45 @@ type Service struct {
 	Password  string
 }
 
+const jitsiCapsNode = "https://jitsi.org/jitsi-meet"
+
+var jitsiMeetFeatures = []string{
+	"http://jabber.org/protocol/caps",
+	"http://jitsi.org/json-encoded-sources",
+	"http://jitsi.org/receive-multiple-video-streams",
+	"http://jitsi.org/remb",
+	"http://jitsi.org/source-name",
+	"http://jitsi.org/start-muted-room-metadata",
+	"http://jitsi.org/tcc",
+	"http://jitsi.org/visitors-1",
+	"urn:ietf:rfc:4588",
+	"urn:xmpp:jingle:1",
+	"urn:xmpp:jingle:apps:dtls:0",
+	"urn:xmpp:jingle:apps:rtp:1",
+	"urn:xmpp:jingle:apps:rtp:audio",
+	"urn:xmpp:jingle:apps:rtp:video",
+	"urn:xmpp:jingle:transports:dtls-sctp:1",
+	"urn:xmpp:jingle:transports:ice-udp:1",
+}
+
+var jitsiCapsVersion = calculateJitsiCapsVersion()
+
 func Dial(ctx context.Context, host, room string, debug bool) (*Conn, error) {
 	url := fmt.Sprintf("wss://%s/xmpp-websocket?room=%s", host, room)
 	ws, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
-		Subprotocols: []string{"xmpp"},
+		Subprotocols:    []string{"xmpp"},
+		CompressionMode: websocket.CompressionContextTakeover,
+		HTTPHeader: http.Header{
+			"Accept":          {"*/*"},
+			"Accept-Language": {"en-US,en;q=0.9"},
+			"Cache-Control":   {"no-cache"},
+			"Origin":          {"https://" + host},
+			"Pragma":          {"no-cache"},
+			"Sec-Fetch-Dest":  {"empty"},
+			"Sec-Fetch-Mode":  {"websocket"},
+			"Sec-Fetch-Site":  {"same-origin"},
+			"User-Agent":      {"Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0"},
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -75,6 +115,7 @@ func Dial(ctx context.Context, host, room string, debug bool) (*Conn, error) {
 		debug:     debug,
 		occupants: make(map[string]struct{}),
 		stanzas:   make(chan string, 64),
+		jingles:   make(chan string, 8),
 		closed:    make(chan struct{}),
 		iqWaiters: make(map[string]chan string),
 	}
@@ -304,9 +345,19 @@ func (c *Conn) readLoop() {
 		}
 
 		// auto-reply to disco#info queries from Jicofo
-		if strings.Contains(msg, "disco#info") && strings.Contains(msg, "type='get'") {
+		if isDiscoInfoGet(msg) {
 			c.handleDiscoQuery(msg)
 			continue
+		}
+
+		if isSessionInitiate(msg) {
+			c.lastJngMu.Lock()
+			c.lastJng = msg
+			c.lastJngMu.Unlock()
+			select {
+			case c.jingles <- msg:
+			default:
+			}
 		}
 
 		select {
@@ -365,8 +416,41 @@ func (c *Conn) handleDiscoQuery(msg string) {
 	if from == "" || id == "" {
 		return
 	}
-	resp := fmt.Sprintf(`<iq to="%s" id="%s" type="result" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:dtls-sctp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="http://jitsi.org/protocol/colibri2"/></query></iq>`, from, id)
+	resp := fmt.Sprintf(`<iq to="%s" id="%s" type="result" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info">%s</query></iq>`,
+		from, id, discoFeatureXML())
 	_ = c.send(resp)
+}
+
+func isDiscoInfoGet(msg string) bool {
+	return strings.Contains(msg, "disco#info") && extractXMLAttr(msg, "type") == "get"
+}
+
+func isSessionInitiate(msg string) bool {
+	return strings.Contains(msg, "jingle") && strings.Contains(msg, "session-initiate")
+}
+
+func discoFeatureXML() string {
+	var b strings.Builder
+	for _, feature := range sortedJitsiMeetFeatures() {
+		fmt.Fprintf(&b, `<feature var="%s"/>`, feature)
+	}
+	return b.String()
+}
+
+func calculateJitsiCapsVersion() string {
+	var s strings.Builder
+	for _, feature := range sortedJitsiMeetFeatures() {
+		s.WriteString(feature)
+		s.WriteByte('<')
+	}
+	sum := sha1.Sum([]byte(s.String()))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func sortedJitsiMeetFeatures() []string {
+	features := append([]string(nil), jitsiMeetFeatures...)
+	sort.Strings(features)
+	return features
 }
 
 func extractXMLAttr(s, attr string) string {
@@ -493,28 +577,30 @@ func (c *Conn) readUntilReturn(ctx context.Context, substr string) (string, erro
 	}
 }
 
-func (c *Conn) DiscoverServices() ([]Service, error) {
+func (c *Conn) DiscoverServices(ctx context.Context) ([]Service, error) {
 	iq := fmt.Sprintf(`<iq type="get" to="%s" id="disco_1" xmlns="jabber:client"><services xmlns="urn:xmpp:extdisco:2"/></iq>`, c.host)
 	if err := c.send(iq); err != nil {
 		return nil, err
 	}
-	return c.waitServices()
+	return c.waitServices(ctx)
 }
 
-func (c *Conn) waitServices() ([]Service, error) {
+func (c *Conn) waitServices(ctx context.Context) ([]Service, error) {
 	for {
 		select {
 		case msg := <-c.stanzas:
 			if strings.Contains(msg, "urn:xmpp:extdisco:2") {
 				return parseServices(msg), nil
 			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		case <-c.closed:
 			return nil, fmt.Errorf("connection closed")
 		}
 	}
 }
 
-func (c *Conn) AllocateFocus(room string) error {
+func (c *Conn) AllocateFocus(ctx context.Context, room string) error {
 	roomJID := fmt.Sprintf("%s@conference.%s", room, c.host)
 	iq := fmt.Sprintf(`<iq to="focus.%s" type="set" id="focus_1" xmlns="jabber:client"><conference room="%s" machine-uid="%s" xmlns="http://jitsi.org/protocol/focus"><property name="rtcstatsEnabled" value="false"/><property name="visitors-version" value="1"/></conference></iq>`,
 		c.host, roomJID, c.nick)
@@ -531,16 +617,18 @@ func (c *Conn) AllocateFocus(room string) error {
 			if strings.Contains(msg, "type=\"error\"") && strings.Contains(msg, "focus_1") {
 				return fmt.Errorf("focus allocation failed: %s", msg)
 			}
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-c.closed:
 			return fmt.Errorf("connection closed")
 		}
 	}
 }
 
-func (c *Conn) JoinMUC(room, displayName string) error {
+func (c *Conn) JoinMUC(ctx context.Context, room, displayName string) error {
 	roomJID := fmt.Sprintf("%s@conference.%s/%s", room, c.host, c.nick)
-	presence := fmt.Sprintf(`<presence to="%s" xmlns="jabber:client"><x xmlns="http://jabber.org/protocol/muc"/><stats-id>%s</stats-id><c hash="sha-1" node="https://jitsi.org/jitsi-meet" ver="location" xmlns="http://jabber.org/protocol/caps"/><SourceInfo>{}</SourceInfo><jitsi_participant_codecList>vp9,vp8,h264</jitsi_participant_codecList><nick xmlns="http://jabber.org/protocol/nick">%s</nick></presence>`,
-		roomJID, displayName[:min(3, len(displayName))]+"-j", displayName)
+	presence := fmt.Sprintf(`<presence to="%s" xmlns="jabber:client"><x xmlns="http://jabber.org/protocol/muc"/><stats-id>%s</stats-id><c hash="sha-1" node="%s" ver="%s" xmlns="http://jabber.org/protocol/caps"/><SourceInfo>{}</SourceInfo><jitsi_participant_codecList>vp8,h264,av1,vp9</jitsi_participant_codecList><nick xmlns="http://jabber.org/protocol/nick">%s</nick></presence>`,
+		roomJID, displayName[:min(3, len(displayName))]+"-j", jitsiCapsNode, jitsiCapsVersion, displayName)
 	if err := c.send(presence); err != nil {
 		return err
 	}
@@ -549,24 +637,29 @@ func (c *Conn) JoinMUC(room, displayName string) error {
 		select {
 		case msg := <-c.stanzas:
 			if strings.Contains(msg, "status code=\"110\"") || strings.Contains(msg, `code='110'`) {
+				_ = c.SendRoomInfo(room)
 				return nil
 			}
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-c.closed:
 			return fmt.Errorf("connection closed")
 		}
 	}
 }
 
+func (c *Conn) SendRoomInfo(room string) error {
+	roomBareJID := fmt.Sprintf("%s@conference.%s", room, c.host)
+	id := c.NextID()
+	iq := fmt.Sprintf(`<iq to="%s" type="get" id="%s" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"/></iq>`, roomBareJID, id)
+	return c.send(iq)
+}
+
 func (c *Conn) WaitJingle(ctx context.Context) (string, error) {
 	for {
 		select {
-		case msg := <-c.stanzas:
-			if strings.Contains(msg, "jingle") && strings.Contains(msg, "session-initiate") {
-				c.lastJngMu.Lock()
-				c.lastJng = msg
-				c.lastJngMu.Unlock()
-				return msg, nil
-			}
+		case msg := <-c.jingles:
+			return msg, nil
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-c.closed:

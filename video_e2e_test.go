@@ -5,6 +5,7 @@ package j
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,7 +20,7 @@ func TestE2EVideoFakePayload(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	room := "j-fake-vp8-test"
+	room := e2eRoom("j-fake-vp8-test")
 	host := "meet.cryptopro.ru"
 
 	// Bot 1: filler (needed for Jicofo to create conference)
@@ -55,6 +56,12 @@ func TestE2EVideoFakePayload(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s pc: %v", name, err)
 		}
+		pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
+			t.Logf("%s ICE: %s", name, s)
+		})
+		pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+			t.Logf("%s PC: %s", name, s)
+		})
 
 		// Send track
 		track, _ := webrtc.NewTrackLocalStaticSample(
@@ -123,7 +130,7 @@ func TestE2EVideoFakePayload(t *testing.T) {
 			}
 		}()
 
-		waitPC(t, pc, 15*time.Second)
+		waitPC(t, pc, 30*time.Second)
 		t.Logf("%s: connected", name)
 
 		// Start sending frames
@@ -238,7 +245,7 @@ func TestE2EVideoNegotiation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	room := "j-video-e2e-test"
+	room := e2eRoom("j-video-e2e-test")
 	host := "meet.cryptopro.ru"
 
 	bot1, err := JoinMUC(ctx, Config{Host: host, Room: room, Nick: "bot1-filler"})
@@ -297,7 +304,7 @@ func TestE2EVideoRecvOnly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	room := "j-video-e2e-recv"
+	room := e2eRoom("j-video-e2e-recv")
 	host := "meet.cryptopro.ru"
 
 	bot1, err := JoinMUC(ctx, Config{Host: host, Room: room, Nick: "bot1-filler"})
@@ -329,6 +336,10 @@ func TestE2EVideoRecvOnly(t *testing.T) {
 	neg.Terminate("success")
 }
 
+func e2eRoom(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
 func waitPC(t *testing.T, pc *webrtc.PeerConnection, timeout time.Duration) {
 	t.Helper()
 	if pc.ConnectionState() == webrtc.PeerConnectionStateConnected {
@@ -346,6 +357,6 @@ func waitPC(t *testing.T, pc *webrtc.PeerConnection, timeout time.Duration) {
 	select {
 	case <-ch:
 	case <-time.After(timeout):
-		t.Logf("PC not connected after %v (state=%s)", timeout, pc.ConnectionState())
+		t.Fatalf("PC not connected after %v (pc=%s ice=%s)", timeout, pc.ConnectionState(), pc.ICEConnectionState())
 	}
 }

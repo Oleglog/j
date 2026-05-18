@@ -73,6 +73,7 @@ func runChat(ctx context.Context, host, room, nick string, debug bool, timeout t
 		os.Exit(1)
 	}
 	defer func() { _ = sess.Close() }()
+	printServerAuth(sess)
 
 	fmt.Fprintf(os.Stderr, "joined! type messages (/raise, /lower, /quit):\n")
 
@@ -138,11 +139,29 @@ func runJingle(ctx context.Context, host, room, nick string, debug bool, timeout
 		"data_channel": sess.DataChannel,
 		"audio_ssrc":   sess.AudioSSRC,
 		"video_ssrc":   sess.VideoSSRC,
+		"server_auth":  sess.ServerAuth,
 	}
 
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(out)
+}
+
+func printServerAuth(sess *j.Session) {
+	auth := sess.ServerAuth
+	authText := "off"
+	if auth.AuthenticationRequired {
+		authText = "on"
+	}
+	guestText := "no"
+	if auth.GuestAccess {
+		guestText = "yes"
+	}
+	externalText := "no"
+	if auth.ExternalAuth {
+		externalText = "yes"
+	}
+	fmt.Fprintf(os.Stderr, "server auth: %s, guest access: %s, external auth: %s\n", authText, guestText, externalText)
 }
 
 // runDC: text broadcast over bridge channel. Each line of stdin → EndpointMessage{text:line}.
@@ -157,6 +176,7 @@ func runDC(ctx context.Context, host, room, nick string, debug bool, timeout tim
 		os.Exit(1)
 	}
 	defer func() { _ = sess.Close() }()
+	printServerAuth(sess)
 
 	if err := sess.OpenBridge(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "open bridge: %v\n", err)
@@ -205,6 +225,7 @@ func runDCRaw(ctx context.Context, host, room, nick string, debug bool, timeout 
 		os.Exit(1)
 	}
 	defer func() { _ = sess.Close() }()
+	printServerAuth(sess)
 
 	if err := sess.OpenBridge(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "open bridge: %v\n", err)
@@ -258,6 +279,7 @@ func runMedia(ctx context.Context, host, room, nick string, debug bool, timeout 
 		os.Exit(1)
 	}
 	defer func() { _ = sess.Close() }()
+	printServerAuth(sess)
 
 	for round := 1; ; round++ {
 		fmt.Fprintf(os.Stderr, "=== media round %d ===\n", round)
@@ -459,6 +481,7 @@ func runBench(ctx context.Context, host, room, nick string, debug bool, timeout 
 		os.Exit(1)
 	}
 	defer func() { _ = sess.Close() }()
+	printServerAuth(sess)
 	if err := sess.OpenBridge(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "open bridge: %v\n", err)
 		os.Exit(1)
@@ -541,6 +564,7 @@ func runBenchXMPP(ctx context.Context, host, room, nick string, debug bool, payl
 		os.Exit(1)
 	}
 	defer func() { _ = sess.Close() }()
+	printServerAuth(sess)
 
 	fmt.Fprintf(os.Stderr, "bench-xmpp: payload=%dB duration=%ds\n", payloadSize, secs)
 

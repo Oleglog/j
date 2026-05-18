@@ -32,6 +32,27 @@ func TestIsSessionInitiate(t *testing.T) {
 	}
 }
 
+func TestParseFocusInfo(t *testing.T) {
+	stanza := `<iq type='result'><conference ready='true' xmlns='http://jitsi.org/protocol/focus'><property name='authentication' value='true'/><property name='externalAuth' value='false'/><property name='visitors-supported' value='true'/></conference></iq>`
+
+	info := parseFocusInfo(stanza)
+	if !info.Ready {
+		t.Fatal("focus ready was not parsed")
+	}
+	if !info.AuthenticationRequired {
+		t.Fatal("authentication=true was not parsed")
+	}
+	if info.ExternalAuth {
+		t.Fatal("externalAuth=false was parsed as true")
+	}
+	if !info.VisitorsSupported {
+		t.Fatal("visitors-supported=true was not parsed")
+	}
+	if info.Properties["authentication"] != "true" {
+		t.Fatalf("properties were not preserved: %#v", info.Properties)
+	}
+}
+
 func TestDiscoFeatureXMLIncludesModernJitsiFeatures(t *testing.T) {
 	xml := discoFeatureXML()
 	for _, feature := range []string{

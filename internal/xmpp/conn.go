@@ -24,6 +24,8 @@ type Conn struct {
 	jid       string
 	nick      string
 	debug     bool
+	anonymous bool
+	focusInfo FocusInfo
 	mu        sync.Mutex
 	ackH      atomic.Int64
 	idSeq     atomic.Int64
@@ -61,6 +63,15 @@ type Service struct {
 	Transport string
 	Username  string
 	Password  string
+}
+
+type FocusInfo struct {
+	Ready                  bool
+	AuthenticationRequired bool
+	ExternalAuth           bool
+	VisitorsSupported      bool
+	AnonymousXMPP          bool
+	Properties             map[string]string
 }
 
 const jitsiCapsNode = "https://jitsi.org/jitsi-meet"
@@ -134,6 +145,15 @@ func (c *Conn) JID() string  { return c.jid }
 func (c *Conn) Nick() string { return c.nick }
 func (c *Conn) Host() string { return c.host }
 func (c *Conn) Room() string { return c.room }
+
+func (c *Conn) FocusInfo() FocusInfo {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	info := c.focusInfo
+	info.AnonymousXMPP = c.anonymous
+	info.Properties = cloneStringMap(info.Properties)
+	return info
+}
 
 // Send transmits an arbitrary XMPP stanza string. Caller is responsible for valid XML
 // (and for adding xmlns="jabber:client" on iq/presence/message).
@@ -485,8 +505,12 @@ func (c *Conn) auth(ctx context.Context) error {
 		return err
 	}
 	// read until we get stream features (server may send open + features separately or together)
-	if err := c.readUntil(ctx, "features"); err != nil {
+	initialFeatures, err := c.readUntilReturn(ctx, "features")
+	if err != nil {
 		return fmt.Errorf("initial features: %w", err)
+	}
+	if !strings.Contains(initialFeatures, "<mechanism>ANONYMOUS</mechanism>") {
+		return fmt.Errorf("server does not advertise anonymous XMPP login")
 	}
 
 	// ANONYMOUS SASL
@@ -496,6 +520,7 @@ func (c *Conn) auth(ctx context.Context) error {
 	if err := c.readUntil(ctx, "success"); err != nil {
 		return fmt.Errorf("sasl: %w", err)
 	}
+	c.anonymous = true
 
 	// phase 2: reopen stream after SASL
 	if err := c.send(open); err != nil {
@@ -612,9 +637,14 @@ func (c *Conn) AllocateFocus(ctx context.Context, room string) error {
 		select {
 		case msg := <-c.stanzas:
 			if strings.Contains(msg, "conference") && strings.Contains(msg, "ready") {
+				info := parseFocusInfo(msg)
+				info.AnonymousXMPP = c.anonymous
+				c.mu.Lock()
+				c.focusInfo = info
+				c.mu.Unlock()
 				return nil
 			}
-			if strings.Contains(msg, "type=\"error\"") && strings.Contains(msg, "focus_1") {
+			if isIQError(msg) && strings.Contains(msg, "focus_1") {
 				return fmt.Errorf("focus allocation failed: %s", msg)
 			}
 		case <-ctx.Done():
@@ -811,6 +841,10 @@ func isIQResultOrError(msg string) bool {
 	return t == "result" || t == "error"
 }
 
+func isIQError(msg string) bool {
+	return strings.HasPrefix(msg, "<iq") && extractXMLAttr(msg, "type") == "error"
+}
+
 // isOwnPresenceUnavailable matches the broadcast Prosody sends back to us
 // when our MUC presence unavailable has been processed: from is our own
 // MUC JID with type="unavailable". This is what fires LeaveMUCWait.
@@ -863,6 +897,49 @@ func parseServices(s string) []Service {
 		result = append(result, Service(svc))
 	}
 	return result
+}
+
+func parseFocusInfo(s string) FocusInfo {
+	type xmlProperty struct {
+		Name  string `xml:"name,attr"`
+		Value string `xml:"value,attr"`
+	}
+	type xmlConference struct {
+		Ready      string        `xml:"ready,attr"`
+		Properties []xmlProperty `xml:"property"`
+	}
+	type xmlIQ struct {
+		Conference xmlConference `xml:"conference"`
+	}
+
+	var iq xmlIQ
+	_ = xml.Unmarshal([]byte(s), &iq)
+
+	props := make(map[string]string)
+	for _, prop := range iq.Conference.Properties {
+		if prop.Name != "" {
+			props[prop.Name] = prop.Value
+		}
+	}
+
+	return FocusInfo{
+		Ready:                  strings.EqualFold(iq.Conference.Ready, "true"),
+		AuthenticationRequired: strings.EqualFold(props["authentication"], "true"),
+		ExternalAuth:           strings.EqualFold(props["externalAuth"], "true"),
+		VisitorsSupported:      strings.EqualFold(props["visitors-supported"], "true"),
+		Properties:             props,
+	}
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func xmlEscape(s string) string {

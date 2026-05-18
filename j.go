@@ -28,6 +28,16 @@ type ICEServer struct {
 	Credential string
 }
 
+type ServerAuthInfo struct {
+	Ready                  bool              `json:"ready"`
+	AuthenticationRequired bool              `json:"authentication_required"`
+	ExternalAuth           bool              `json:"external_auth"`
+	GuestAccess            bool              `json:"guest_access"`
+	AnonymousXMPP          bool              `json:"anonymous_xmpp"`
+	VisitorsSupported      bool              `json:"visitors_supported"`
+	Properties             map[string]string `json:"properties,omitempty"`
+}
+
 // Message is an incoming groupchat message.
 type Message struct {
 	From string // nickname of sender (resource part of JID)
@@ -111,6 +121,7 @@ type Session struct {
 	AudioSSRC   []jingle.Source
 	VideoSSRC   []jingle.Source
 	ColibriWS   string // bridge WebSocket URL — use for sending EndpointMessage to other participants
+	ServerAuth  ServerAuthInfo
 	Conn        *xmpp.Conn
 
 	bridge    *colibri.Conn
@@ -363,6 +374,7 @@ func JoinMUC(ctx context.Context, cfg Config) (*Session, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("allocate focus: %w", err)
 	}
+	serverAuth := convertFocusInfo(conn.FocusInfo())
 
 	if err := conn.JoinMUC(ctx, cfg.Room, cfg.Nick); err != nil {
 		_ = conn.Close()
@@ -370,10 +382,11 @@ func JoinMUC(ctx context.Context, cfg Config) (*Session, error) {
 	}
 
 	return &Session{
-		JID:     conn.JID(),
-		RoomJID: fmt.Sprintf("%s@conference.%s", cfg.Room, cfg.Host),
-		Conn:    conn,
-		room:    cfg.Room,
+		JID:        conn.JID(),
+		RoomJID:    fmt.Sprintf("%s@conference.%s", cfg.Room, cfg.Host),
+		ServerAuth: serverAuth,
+		Conn:       conn,
+		room:       cfg.Room,
 	}, nil
 }
 
@@ -400,6 +413,7 @@ func Join(ctx context.Context, cfg Config) (*Session, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("allocate focus: %w", err)
 	}
+	serverAuth := convertFocusInfo(conn.FocusInfo())
 
 	if err := conn.JoinMUC(ctx, cfg.Room, cfg.Nick); err != nil {
 		_ = conn.Close()
@@ -424,6 +438,7 @@ func Join(ctx context.Context, cfg Config) (*Session, error) {
 		AudioSSRC:   parsed.AudioSources,
 		VideoSSRC:   parsed.VideoSources,
 		ColibriWS:   parsed.ColibriWS,
+		ServerAuth:  serverAuth,
 		Conn:        conn,
 		room:        cfg.Room,
 		jingleSID:   parsed.SID,
@@ -431,6 +446,18 @@ func Join(ctx context.Context, cfg Config) (*Session, error) {
 	}
 
 	return sess, nil
+}
+
+func convertFocusInfo(info xmpp.FocusInfo) ServerAuthInfo {
+	return ServerAuthInfo{
+		Ready:                  info.Ready,
+		AuthenticationRequired: info.AuthenticationRequired,
+		ExternalAuth:           info.ExternalAuth,
+		GuestAccess:            info.AnonymousXMPP && info.Ready,
+		AnonymousXMPP:          info.AnonymousXMPP,
+		VisitorsSupported:      info.VisitorsSupported,
+		Properties:             info.Properties,
+	}
 }
 
 func convertICE(services []xmpp.Service) []ICEServer {

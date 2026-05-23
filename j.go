@@ -301,7 +301,10 @@ func (s *Session) IceConfig() webrtc.Configuration {
 			Credential: ice.Credential,
 		})
 	}
-	return webrtc.Configuration{ICEServers: srvs}
+	return webrtc.Configuration{
+		ICEServers:         srvs,
+		ICETransportPolicy: webrtc.ICETransportPolicyRelay,
+	}
 }
 
 func (s *Session) Accept(sdp string) error {

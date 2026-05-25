@@ -156,11 +156,14 @@ func Dial(ctx context.Context, host, room string, debug, insecure bool) (*Conn, 
 // XMPP domains. It supports both Jitsi config formats:
 //
 //	config.hosts.domain = 'meet.jitsi'   (docker-jitsi-meet)
-//	config.hosts.muc = 'muc.meet.jitsi'
+//	config.hosts.muc = 'muc.' + subdomain + 'meet.jitsi'
 //
 // and the inline form:
 //
 //	{ domain: 'meet.example.com', muc: 'conference.meet.example.com' }
+//
+// String concatenation is handled by joining all string literals on the right
+// side and ignoring identifiers (subdomain is typically an empty string).
 //
 // Returns (mucDomain, xmppDomain). Falls back to "conference."+host and host
 // respectively if config.js is unreachable or unparseable.
@@ -181,19 +184,23 @@ func fetchConfig(host string, insecure bool) (mucDomain, xmppDomain string) {
 	body := string(buf[:n])
 	if v := extractStringField(body, "domain"); v != "" {
 		xmppDomain = v
-		// docker-jitsi-meet convention: muc lives at muc.<xmppDomain>
-		mucDomain = "muc." + v
 	}
-	// Explicit muc setting overrides the default — but only if it looks like
-	// a complete domain (not a fragment from `'muc.' + subdomain + ...`).
-	if v := extractStringField(body, "muc"); v != "" && !strings.HasSuffix(v, ".") {
+	if v := extractStringField(body, "muc"); v != "" {
 		mucDomain = v
 	}
 	return
 }
 
-// extractStringField finds `<key>: 'value'` or `<key>: "value"` in JS source
-// (matches both `config.hosts.muc = 'foo'` and inline `muc: 'foo'`).
+// extractStringField finds `<key>: <expr>` or `<key> = <expr>` in JS source
+// and returns the concatenation of all string literals in <expr>. Identifiers
+// (variables) are treated as empty strings — this matches the typical Jitsi
+// config pattern where `subdomain` is empty by default.
+//
+// Examples:
+//
+//	muc: 'muc.meet.jitsi'                   → "muc.meet.jitsi"
+//	muc: 'conference.' + subdomain + 'host' → "conference.host"
+//	domain = 'meet.example.com'             → "meet.example.com"
 func extractStringField(body, key string) string {
 	for _, line := range strings.Split(body, "\n") {
 		t := strings.TrimSpace(line)
@@ -204,21 +211,41 @@ func extractStringField(body, key string) string {
 			continue
 		}
 		rest := strings.TrimPrefix(t, key)
+		// require ":", "=", or whitespace after key (avoid matching e.g. "domain2")
+		if len(rest) == 0 || (rest[0] != ':' && rest[0] != '=' && rest[0] != ' ' && rest[0] != '\t') {
+			continue
+		}
 		rest = strings.TrimLeft(rest, " \t:=")
-		if len(rest) == 0 {
-			continue
+		// strip trailing comment / semicolon / comma — only the expression matters
+		if i := strings.IndexAny(rest, ";,/"); i >= 0 {
+			rest = rest[:i]
 		}
-		q := rest[0]
-		if q != '\'' && q != '"' {
-			continue
+		v := joinStringLiterals(rest)
+		if v != "" {
+			return v
 		}
-		end := strings.IndexByte(rest[1:], q)
-		if end <= 0 {
-			continue
-		}
-		return rest[1 : 1+end]
 	}
 	return ""
+}
+
+// joinStringLiterals walks a JS expression and concatenates all single- or
+// double-quoted string literals. Other tokens (identifiers, "+", whitespace)
+// are ignored.
+func joinStringLiterals(expr string) string {
+	var out strings.Builder
+	for i := 0; i < len(expr); i++ {
+		c := expr[i]
+		if c != '\'' && c != '"' {
+			continue
+		}
+		end := strings.IndexByte(expr[i+1:], c)
+		if end < 0 {
+			break
+		}
+		out.WriteString(expr[i+1 : i+1+end])
+		i += 1 + end
+	}
+	return out.String()
 }
 
 func (c *Conn) JID() string  { return c.jid }

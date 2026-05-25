@@ -226,11 +226,14 @@ func (s *Session) WaitBridgeSCTP(ctx context.Context) error {
 	}
 
 	br := colibri.WrapDataChannel(dc)
-	// Send ClientHello to register this endpoint with JVB's message router.
-	// We don't wait for ServerHello — doing so would race with EndpointMessages
-	// from other peers that may arrive before ServerHello.
+	// Send ClientHello and wait for ServerHello — this confirms JVB has
+	// registered our endpoint for message routing. Without this wait,
+	// messages sent immediately after may be dropped by JVB.
 	if err := br.SendJSON(map[string]any{"colibriClass": "ClientHello"}); err != nil {
 		return fmt.Errorf("send ClientHello: %w", err)
+	}
+	if err := waitServerHello(ctx, br); err != nil {
+		return fmt.Errorf("wait ServerHello: %w", err)
 	}
 	s.bridgeMu.Lock()
 	s.bridge = br
@@ -241,6 +244,32 @@ func (s *Session) WaitBridgeSCTP(ctx context.Context) error {
 }
 
 func strPtr(s string) *string { return &s }
+
+// waitServerHello reads from the bridge until ServerHello arrives, then
+// re-delivers any messages received before it. JVB sends ServerHello in
+// response to ClientHello once the endpoint is registered for routing.
+func waitServerHello(ctx context.Context, br colibri.Bridge) error {
+	var buffered []colibri.Message
+	for {
+		select {
+		case m, ok := <-br.Messages():
+			if !ok {
+				return fmt.Errorf("bridge closed before ServerHello")
+			}
+			if m.Class == "ServerHello" {
+				// Replay buffered messages back into the bridge incoming channel
+				// so callers don't miss them.
+				if c, ok := br.(*colibri.SCTPBridge); ok {
+					c.PrependMessages(buffered)
+				}
+				return nil
+			}
+			buffered = append(buffered, m)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
 
 // SetBridge sets an externally-provided Bridge (e.g. SCTP DataChannel wrapper).
 // Bridge returns the underlying bridge connection (after OpenBridge or WaitBridgeSCTP).

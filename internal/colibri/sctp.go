@@ -136,6 +136,20 @@ func (b *SCTPBridge) RawFrames() <-chan []byte     { return b.rawIn }
 func (b *SCTPBridge) SendQueueDepth() int         { return 0 }
 func (b *SCTPBridge) CanSend() bool               { return true }
 
+// PrependMessages re-enqueues messages at the front of the incoming channel.
+// Used to replay messages that were peeked during handshake.
+func (b *SCTPBridge) PrependMessages(msgs []Message) {
+	for _, m := range msgs {
+		select {
+		case b.incoming <- m:
+		case <-b.closed:
+			return
+		default:
+			// drop on overflow
+		}
+	}
+}
+
 func (b *SCTPBridge) Close() error {
 	b.closeOnce.Do(func() { close(b.closed) })
 	return b.dc.Close()

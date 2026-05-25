@@ -22,6 +22,7 @@ type Conn struct {
 	ws        *websocket.Conn
 	host      string
 	room      string
+	mucDomain string // e.g. "muc.meet1.arbitr.ru" or "conference.meet1.arbitr.ru"
 	jid       string
 	nick      string
 	debug     bool
@@ -129,6 +130,7 @@ func Dial(ctx context.Context, host, room string, debug, insecure bool) (*Conn, 
 		ws:        ws,
 		host:      host,
 		room:      room,
+		mucDomain: fetchMUCDomain(host, insecure),
 		debug:     debug,
 		occupants: make(map[string]struct{}),
 		stanzas:   make(chan string, 64),
@@ -147,10 +149,42 @@ func Dial(ctx context.Context, host, room string, debug, insecure bool) (*Conn, 
 	return c, nil
 }
 
+func fetchMUCDomain(host string, insecure bool) string {
+	client := http.DefaultClient
+	if insecure {
+		client = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	}
+	resp, err := client.Get("https://" + host + "/config.js")
+	if err != nil {
+		return "conference." + host
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 64*1024)
+	n, _ := resp.Body.Read(buf)
+	body := string(buf[:n])
+	// parse: muc: 'muc.example.com'
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "muc:") || strings.HasPrefix(trimmed, "muc :") {
+			// extract value between quotes
+			for i := 0; i < len(trimmed); i++ {
+				if trimmed[i] == '\'' || trimmed[i] == '"' {
+					end := strings.IndexByte(trimmed[i+1:], trimmed[i])
+					if end > 0 {
+						return trimmed[i+1 : i+1+end]
+					}
+				}
+			}
+		}
+	}
+	return "conference." + host
+}
+
 func (c *Conn) JID() string  { return c.jid }
-func (c *Conn) Nick() string { return c.nick }
-func (c *Conn) Host() string { return c.host }
-func (c *Conn) Room() string { return c.room }
+func (c *Conn) Nick() string      { return c.nick }
+func (c *Conn) Host() string      { return c.host }
+func (c *Conn) Room() string      { return c.room }
+func (c *Conn) MUCDomain() string { return c.mucDomain }
 
 func (c *Conn) FocusInfo() FocusInfo {
 	c.mu.Lock()
@@ -632,7 +666,7 @@ func (c *Conn) waitServices(ctx context.Context) ([]Service, error) {
 }
 
 func (c *Conn) AllocateFocus(ctx context.Context, room string) error {
-	roomJID := fmt.Sprintf("%s@conference.%s", room, c.host)
+	roomJID := fmt.Sprintf("%s@%s", room, c.mucDomain)
 	iq := fmt.Sprintf(`<iq to="focus.%s" type="set" id="focus_1" xmlns="jabber:client"><conference room="%s" machine-uid="%s" xmlns="http://jitsi.org/protocol/focus"><property name="rtcstatsEnabled" value="false"/><property name="visitors-version" value="1"/></conference></iq>`,
 		c.host, roomJID, c.nick)
 	if err := c.send(iq); err != nil {
@@ -662,7 +696,7 @@ func (c *Conn) AllocateFocus(ctx context.Context, room string) error {
 }
 
 func (c *Conn) JoinMUC(ctx context.Context, room, displayName string) error {
-	roomJID := fmt.Sprintf("%s@conference.%s/%s", room, c.host, c.nick)
+	roomJID := fmt.Sprintf("%s@%s/%s", room, c.mucDomain, c.nick)
 	presence := fmt.Sprintf(`<presence to="%s" xmlns="jabber:client"><x xmlns="http://jabber.org/protocol/muc"/><stats-id>%s</stats-id><c hash="sha-1" node="%s" ver="%s" xmlns="http://jabber.org/protocol/caps"/><SourceInfo>{}</SourceInfo><jitsi_participant_codecList>vp8,h264,av1,vp9</jitsi_participant_codecList><nick xmlns="http://jabber.org/protocol/nick">%s</nick></presence>`,
 		roomJID, displayName[:min(3, len(displayName))]+"-j", jitsiCapsNode, jitsiCapsVersion, displayName)
 	if err := c.send(presence); err != nil {
@@ -685,7 +719,7 @@ func (c *Conn) JoinMUC(ctx context.Context, room, displayName string) error {
 }
 
 func (c *Conn) SendRoomInfo(room string) error {
-	roomBareJID := fmt.Sprintf("%s@conference.%s", room, c.host)
+	roomBareJID := fmt.Sprintf("%s@%s", room, c.mucDomain)
 	id := c.NextID()
 	iq := fmt.Sprintf(`<iq to="%s" type="get" id="%s" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"/></iq>`, roomBareJID, id)
 	return c.send(iq)
@@ -743,18 +777,18 @@ func (c *Conn) SendGroupchat(roomJID, body string) error {
 }
 
 func (c *Conn) RaiseHand(room string) error {
-	roomJID := fmt.Sprintf("%s@conference.%s/%s", room, c.host, c.nick)
+	roomJID := fmt.Sprintf("%s@%s/%s", room, c.mucDomain, c.nick)
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
 	return c.send(fmt.Sprintf(`<presence to="%s" xmlns="jabber:client"><jitsi_participant_raisedHand>%s</jitsi_participant_raisedHand></presence>`, roomJID, ts))
 }
 
 func (c *Conn) LowerHand(room string) error {
-	roomJID := fmt.Sprintf("%s@conference.%s/%s", room, c.host, c.nick)
+	roomJID := fmt.Sprintf("%s@%s/%s", room, c.mucDomain, c.nick)
 	return c.send(fmt.Sprintf(`<presence to="%s" xmlns="jabber:client"><jitsi_participant_raisedHand/></presence>`, roomJID))
 }
 
 func (c *Conn) LeaveMUC(room string) error {
-	roomJID := fmt.Sprintf("%s@conference.%s/%s", room, c.host, c.nick)
+	roomJID := fmt.Sprintf("%s@%s/%s", room, c.mucDomain, c.nick)
 	return c.send(fmt.Sprintf(`<presence to="%s" type="unavailable" xmlns="jabber:client"/>`, roomJID))
 }
 
@@ -775,7 +809,7 @@ func (c *Conn) LeaveMUCWait(room string, timeout time.Duration) error {
 	}
 	c.waitMu.Unlock()
 
-	roomJID := fmt.Sprintf("%s@conference.%s/%s", room, c.host, c.nick)
+	roomJID := fmt.Sprintf("%s@%s/%s", room, c.mucDomain, c.nick)
 	if err := c.send(fmt.Sprintf(`<presence to="%s" type="unavailable" xmlns="jabber:client"/>`, roomJID)); err != nil {
 		c.waitMu.Lock()
 		if c.leaveWaiter == w {
@@ -862,7 +896,7 @@ func (c *Conn) isOwnPresenceUnavailable(msg string) bool {
 	if from == "" || c.nick == "" || c.room == "" {
 		return false
 	}
-	want := fmt.Sprintf("%s@conference.%s/%s", c.room, c.host, c.nick)
+	want := fmt.Sprintf("%s@%s/%s", c.room, c.mucDomain, c.nick)
 	return from == want
 }
 

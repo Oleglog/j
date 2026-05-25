@@ -387,7 +387,7 @@ func JoinMUC(ctx context.Context, cfg Config) (*Session, error) {
 
 	return &Session{
 		JID:        conn.JID(),
-		RoomJID:    fmt.Sprintf("%s@conference.%s", cfg.Room, cfg.Host),
+		RoomJID:    fmt.Sprintf("%s@%s", cfg.Room, conn.MUCDomain()),
 		ServerAuth: serverAuth,
 		Conn:       conn,
 		room:       cfg.Room,
@@ -434,7 +434,7 @@ func Join(ctx context.Context, cfg Config) (*Session, error) {
 
 	sess := &Session{
 		JID:         conn.JID(),
-		RoomJID:     fmt.Sprintf("%s@conference.%s", cfg.Room, cfg.Host),
+		RoomJID:     fmt.Sprintf("%s@%s", cfg.Room, conn.MUCDomain()),
 		SDP:         parsed.SDP,
 		ICEServers:  convertICE(services),
 		Candidates:  parsed.Candidates,

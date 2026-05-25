@@ -23,6 +23,7 @@ type Conn struct {
 	host      string
 	room      string
 	mucDomain string // e.g. "muc.meet1.arbitr.ru" or "conference.meet1.arbitr.ru"
+	xmppDomain string // XMPP virtualhost — usually equals host, but docker-jitsi-meet uses "meet.jitsi"
 	jid       string
 	nick      string
 	debug     bool
@@ -126,17 +127,19 @@ func Dial(ctx context.Context, host, room string, debug, insecure bool) (*Conn, 
 	}
 	ws.SetReadLimit(1 << 20)
 
+	mucDomain, xmppDomain := fetchConfig(host, insecure)
 	c := &Conn{
-		ws:        ws,
-		host:      host,
-		room:      room,
-		mucDomain: fetchMUCDomain(host, insecure),
-		debug:     debug,
-		occupants: make(map[string]struct{}),
-		stanzas:   make(chan string, 64),
-		jingles:   make(chan string, 8),
-		closed:    make(chan struct{}),
-		iqWaiters: make(map[string]chan string),
+		ws:         ws,
+		host:       host,
+		room:       room,
+		mucDomain:  mucDomain,
+		xmppDomain: xmppDomain,
+		debug:      debug,
+		occupants:  make(map[string]struct{}),
+		stanzas:    make(chan string, 64),
+		jingles:    make(chan string, 8),
+		closed:     make(chan struct{}),
+		iqWaiters:  make(map[string]chan string),
 	}
 
 	if err := c.auth(ctx); err != nil {
@@ -149,35 +152,73 @@ func Dial(ctx context.Context, host, room string, debug, insecure bool) (*Conn, 
 	return c, nil
 }
 
-func fetchMUCDomain(host string, insecure bool) string {
+// fetchConfig downloads /config.js from the host and extracts the MUC and
+// XMPP domains. It supports both Jitsi config formats:
+//
+//	config.hosts.domain = 'meet.jitsi'   (docker-jitsi-meet)
+//	config.hosts.muc = 'muc.meet.jitsi'
+//
+// and the inline form:
+//
+//	{ domain: 'meet.example.com', muc: 'conference.meet.example.com' }
+//
+// Returns (mucDomain, xmppDomain). Falls back to "conference."+host and host
+// respectively if config.js is unreachable or unparseable.
+func fetchConfig(host string, insecure bool) (mucDomain, xmppDomain string) {
+	mucDomain = "conference." + host
+	xmppDomain = host
 	client := http.DefaultClient
 	if insecure {
 		client = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 	}
 	resp, err := client.Get("https://" + host + "/config.js")
 	if err != nil {
-		return "conference." + host
+		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 	buf := make([]byte, 64*1024)
 	n, _ := resp.Body.Read(buf)
 	body := string(buf[:n])
-	// parse: muc: 'muc.example.com'
-	for _, line := range strings.Split(body, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "muc:") || strings.HasPrefix(trimmed, "muc :") {
-			// extract value between quotes
-			for i := 0; i < len(trimmed); i++ {
-				if trimmed[i] == '\'' || trimmed[i] == '"' {
-					end := strings.IndexByte(trimmed[i+1:], trimmed[i])
-					if end > 0 {
-						return trimmed[i+1 : i+1+end]
-					}
-				}
-			}
-		}
+	if v := extractStringField(body, "domain"); v != "" {
+		xmppDomain = v
+		// docker-jitsi-meet convention: muc lives at muc.<xmppDomain>
+		mucDomain = "muc." + v
 	}
-	return "conference." + host
+	// Explicit muc setting overrides the default — but only if it looks like
+	// a complete domain (not a fragment from `'muc.' + subdomain + ...`).
+	if v := extractStringField(body, "muc"); v != "" && !strings.HasSuffix(v, ".") {
+		mucDomain = v
+	}
+	return
+}
+
+// extractStringField finds `<key>: 'value'` or `<key>: "value"` in JS source
+// (matches both `config.hosts.muc = 'foo'` and inline `muc: 'foo'`).
+func extractStringField(body, key string) string {
+	for _, line := range strings.Split(body, "\n") {
+		t := strings.TrimSpace(line)
+		// Strip leading "config.hosts." / "config." prefixes for assignment style.
+		t = strings.TrimPrefix(t, "config.hosts.")
+		t = strings.TrimPrefix(t, "config.")
+		if !strings.HasPrefix(t, key) {
+			continue
+		}
+		rest := strings.TrimPrefix(t, key)
+		rest = strings.TrimLeft(rest, " \t:=")
+		if len(rest) == 0 {
+			continue
+		}
+		q := rest[0]
+		if q != '\'' && q != '"' {
+			continue
+		}
+		end := strings.IndexByte(rest[1:], q)
+		if end <= 0 {
+			continue
+		}
+		return rest[1 : 1+end]
+	}
+	return ""
 }
 
 func (c *Conn) JID() string  { return c.jid }
@@ -538,7 +579,7 @@ func extractXMLAttr(s, attr string) string {
 }
 
 func (c *Conn) auth(ctx context.Context) error {
-	open := fmt.Sprintf(`<open to="%s" version="1.0" xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>`, c.host)
+	open := fmt.Sprintf(`<open to="%s" version="1.0" xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>`, c.xmppDomain)
 
 	// phase 1: open stream
 	if err := c.send(open); err != nil {
@@ -643,7 +684,7 @@ func (c *Conn) readUntilReturn(ctx context.Context, substr string) (string, erro
 }
 
 func (c *Conn) DiscoverServices(ctx context.Context) ([]Service, error) {
-	iq := fmt.Sprintf(`<iq type="get" to="%s" id="disco_1" xmlns="jabber:client"><services xmlns="urn:xmpp:extdisco:2"/></iq>`, c.host)
+	iq := fmt.Sprintf(`<iq type="get" to="%s" id="disco_1" xmlns="jabber:client"><services xmlns="urn:xmpp:extdisco:2"/></iq>`, c.xmppDomain)
 	if err := c.send(iq); err != nil {
 		return nil, err
 	}
@@ -657,6 +698,11 @@ func (c *Conn) waitServices(ctx context.Context) ([]Service, error) {
 			if strings.Contains(msg, "urn:xmpp:extdisco:2") {
 				return parseServices(msg), nil
 			}
+			// Server doesn't support extdisco:2 — return empty list, ICE will
+			// rely on host candidates only (or whatever Jicofo provides in jingle).
+			if strings.Contains(msg, `id='disco_1'`) && strings.Contains(msg, `type='error'`) {
+				return nil, nil
+			}
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-c.closed:
@@ -668,7 +714,7 @@ func (c *Conn) waitServices(ctx context.Context) ([]Service, error) {
 func (c *Conn) AllocateFocus(ctx context.Context, room string) error {
 	roomJID := fmt.Sprintf("%s@%s", room, c.mucDomain)
 	iq := fmt.Sprintf(`<iq to="focus.%s" type="set" id="focus_1" xmlns="jabber:client"><conference room="%s" machine-uid="%s" xmlns="http://jitsi.org/protocol/focus"><property name="rtcstatsEnabled" value="false"/><property name="visitors-version" value="1"/></conference></iq>`,
-		c.host, roomJID, c.nick)
+		c.xmppDomain, roomJID, c.nick)
 	if err := c.send(iq); err != nil {
 		return err
 	}

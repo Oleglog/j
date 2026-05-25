@@ -226,6 +226,10 @@ func (s *Session) WaitBridgeSCTP(ctx context.Context) error {
 	}
 
 	br := colibri.WrapDataChannel(dc)
+	// Send ClientHello to activate JVB message routing for this endpoint
+	if err := br.SendJSON(map[string]any{"colibriClass": "ClientHello"}); err != nil {
+		return fmt.Errorf("send ClientHello: %w", err)
+	}
 	s.bridgeMu.Lock()
 	s.bridge = br
 	s.sctpDC = nil

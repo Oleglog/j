@@ -70,7 +70,7 @@ func (b *SCTPBridge) send(data []byte) error {
 		return fmt.Errorf("datachannel closed")
 	default:
 	}
-	return b.dc.Send(data)
+	return b.dc.SendText(string(data))
 }
 
 func (b *SCTPBridge) SendJSON(payload any) error {

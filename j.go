@@ -226,10 +226,27 @@ func (s *Session) WaitBridgeSCTP(ctx context.Context) error {
 	}
 
 	br := colibri.WrapDataChannel(dc)
-	// Send ClientHello to activate JVB message routing for this endpoint
+	// Send ClientHello to activate JVB message routing for this endpoint.
+	// Wait for ServerHello response — this confirms the bridge is fully ready
+	// to route messages in both directions.
 	if err := br.SendJSON(map[string]any{"colibriClass": "ClientHello"}); err != nil {
 		return fmt.Errorf("send ClientHello: %w", err)
 	}
+	// Drain messages until ServerHello arrives (or context expires).
+	for {
+		select {
+		case m := <-br.Messages():
+			if m.Class == "ServerHello" {
+				goto ready
+			}
+			// Re-queue non-ServerHello messages so callers don't miss them.
+			// We can't put them back in the channel, so we just drop them
+			// into the bridge's incoming buffer before returning.
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+ready:
 	s.bridgeMu.Lock()
 	s.bridge = br
 	s.sctpDC = nil

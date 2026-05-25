@@ -125,7 +125,7 @@ type Session struct {
 	ServerAuth  ServerAuthInfo
 	Conn        *xmpp.Conn
 
-	bridge    *colibri.Conn
+	bridge    colibri.Bridge
 	bridgeMu  sync.Mutex
 	room      string
 	jingleSID string
@@ -151,25 +151,72 @@ func (s *Session) RequestVideo(ctx context.Context, maxHeight int) error {
 
 // OpenBridge connects to the Jitsi bridge channel (colibri-ws) using the URL from the
 // Jingle session-initiate. Subsequent calls return the existing connection.
+// If colibri-ws URL is available, uses WebSocket. Otherwise returns an error;
+// use OpenBridgeSCTP(pc) for SCTP datachannel fallback.
 func (s *Session) OpenBridge(ctx context.Context) error {
 	s.bridgeMu.Lock()
 	defer s.bridgeMu.Unlock()
 	if s.bridge != nil {
 		return nil
 	}
-	if s.ColibriWS == "" {
-		return fmt.Errorf("no colibri-ws URL in jingle offer; need session-initiate from Jicofo first")
+	if s.ColibriWS != "" {
+		br, err := colibri.Dial(ctx, s.ColibriWS)
+		if err != nil {
+			return err
+		}
+		s.bridge = br
+		return nil
 	}
-	br, err := colibri.Dial(ctx, s.ColibriWS)
+	return fmt.Errorf("no colibri-ws URL; use OpenBridgeSCTP(pc) for SCTP datachannel")
+}
+
+// OpenBridgeSCTP opens the bridge channel via SCTP datachannel on the given PeerConnection.
+// It creates a DataChannel named "JVB data channel" with the colibri protocol,
+// then waits for it to open. This is the fallback when colibri-ws is not available.
+func (s *Session) OpenBridgeSCTP(ctx context.Context, pc *webrtc.PeerConnection) error {
+	s.bridgeMu.Lock()
+	if s.bridge != nil {
+		s.bridgeMu.Unlock()
+		return nil
+	}
+	s.bridgeMu.Unlock()
+
+	ordered := true
+	dc, err := pc.CreateDataChannel("JVB data channel", &webrtc.DataChannelInit{
+		Protocol: strPtr("http://jitsi.org/protocols/colibri"),
+		Ordered:  &ordered,
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("create datachannel: %w", err)
 	}
+
+	opened := make(chan struct{})
+	dc.OnOpen(func() { close(opened) })
+
+	select {
+	case <-opened:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	br := colibri.WrapDataChannel(dc)
+	s.bridgeMu.Lock()
 	s.bridge = br
+	s.bridgeMu.Unlock()
 	return nil
 }
 
-// Bridge returns the underlying bridge connection (after OpenBridge).
-func (s *Session) Bridge() *colibri.Conn {
+func strPtr(s string) *string { return &s }
+
+// SetBridge sets an externally-provided Bridge (e.g. SCTP DataChannel wrapper).
+func (s *Session) SetBridge(br colibri.Bridge) {
+	s.bridgeMu.Lock()
+	defer s.bridgeMu.Unlock()
+	s.bridge = br
+}
+
+// Bridge returns the underlying bridge connection (after OpenBridge or SetBridge).
+func (s *Session) Bridge() colibri.Bridge {
 	s.bridgeMu.Lock()
 	defer s.bridgeMu.Unlock()
 	return s.bridge

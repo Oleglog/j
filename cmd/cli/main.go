@@ -179,12 +179,11 @@ func runDC(ctx context.Context, host, room, nick string, debug, insecure bool, t
 	defer func() { _ = sess.Close() }()
 	printServerAuth(sess)
 
-	if err := sess.OpenBridge(ctx); err != nil {
+	if err := openBridgeAuto(ctx, sess); err != nil {
 		fmt.Fprintf(os.Stderr, "open bridge: %v\n", err)
 		os.Exit(1)
 	}
-
-	fmt.Fprintln(os.Stderr, "bridge connected. type messages to broadcast, /quit to exit:")
+	fmt.Fprintln(os.Stderr, "type messages to broadcast, /quit to exit:")
 
 	go func() {
 		for m := range sess.BridgeMessages() {
@@ -228,12 +227,10 @@ func runDCRaw(ctx context.Context, host, room, nick string, debug, insecure bool
 	defer func() { _ = sess.Close() }()
 	printServerAuth(sess)
 
-	if err := sess.OpenBridge(ctx); err != nil {
+	if err := openBridgeAuto(ctx, sess); err != nil {
 		fmt.Fprintf(os.Stderr, "open bridge: %v\n", err)
 		os.Exit(1)
 	}
-
-	fmt.Fprintln(os.Stderr, "bridge connected. raw mode: stdin (bytes) ←→ bridge ←→ stdout")
 
 	// receive: decode raw frames to stdout, log other classes to stderr
 	go func() {
@@ -483,7 +480,7 @@ func runBench(ctx context.Context, host, room, nick string, debug, insecure bool
 	}
 	defer func() { _ = sess.Close() }()
 	printServerAuth(sess)
-	if err := sess.OpenBridge(ctx); err != nil {
+	if err := openBridgeAuto(ctx, sess); err != nil {
 		fmt.Fprintf(os.Stderr, "open bridge: %v\n", err)
 		os.Exit(1)
 	}
@@ -672,4 +669,34 @@ func readLines(ctx context.Context) <-chan string {
 		}
 	}()
 	return out
+}
+
+// openBridgeAuto opens the bridge channel using colibri-ws if available,
+// otherwise falls back to SCTP datachannel via a new PeerConnection.
+// Returns a cleanup function for the PC (nil if colibri-ws was used).
+func openBridgeAuto(ctx context.Context, sess *j.Session) error {
+	if sess.ColibriWS != "" {
+		if err := sess.OpenBridge(ctx); err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "bridge connected (colibri-ws)")
+		return nil
+	}
+	fmt.Fprintln(os.Stderr, "no colibri-ws, using SCTP datachannel...")
+	pc, err := webrtc.NewPeerConnection(sess.IceConfig())
+	if err != nil {
+		return fmt.Errorf("new pc: %w", err)
+	}
+	neg := sess.Negotiator()
+	neg.PC = pc
+	if err := neg.Accept(ctx); err != nil {
+		_ = pc.Close()
+		return fmt.Errorf("accept: %w", err)
+	}
+	if err := sess.OpenBridgeSCTP(ctx, pc); err != nil {
+		_ = pc.Close()
+		return fmt.Errorf("sctp: %w", err)
+	}
+	fmt.Fprintln(os.Stderr, "bridge connected (sctp)")
+	return nil
 }

@@ -127,6 +127,8 @@ type Session struct {
 
 	bridge    colibri.Bridge
 	bridgeMu  sync.Mutex
+	sctpDC    *webrtc.DataChannel
+	sctpReady chan struct{}
 	room      string
 	jingleSID string
 	initiator string
@@ -170,16 +172,15 @@ func (s *Session) OpenBridge(ctx context.Context) error {
 	return fmt.Errorf("no colibri-ws URL; use OpenBridgeSCTP(pc) for SCTP datachannel")
 }
 
-// OpenBridgeSCTP opens the bridge channel via SCTP datachannel on the given PeerConnection.
-// It creates a DataChannel named "JVB data channel" with the colibri protocol,
-// then waits for it to open. This is the fallback when colibri-ws is not available.
-func (s *Session) OpenBridgeSCTP(ctx context.Context, pc *webrtc.PeerConnection) error {
+// PrepareBridgeSCTP creates the DataChannel on the PeerConnection BEFORE Accept,
+// so it gets included in the SDP answer. Call WaitBridgeSCTP after Accept to wait
+// for the channel to open.
+func (s *Session) PrepareBridgeSCTP(pc *webrtc.PeerConnection) error {
 	s.bridgeMu.Lock()
+	defer s.bridgeMu.Unlock()
 	if s.bridge != nil {
-		s.bridgeMu.Unlock()
 		return nil
 	}
-	s.bridgeMu.Unlock()
 
 	ordered := true
 	dc, err := pc.CreateDataChannel("JVB data channel", &webrtc.DataChannelInit{
@@ -190,11 +191,36 @@ func (s *Session) OpenBridgeSCTP(ctx context.Context, pc *webrtc.PeerConnection)
 		return fmt.Errorf("create datachannel: %w", err)
 	}
 
-	opened := make(chan struct{})
-	dc.OnOpen(func() { close(opened) })
+	opened := make(chan struct{}, 1)
+	dc.OnOpen(func() {
+		select {
+		case opened <- struct{}{}:
+		default:
+		}
+	})
+	s.sctpDC = dc
+	s.sctpReady = opened
+	return nil
+}
+
+// WaitBridgeSCTP waits for the DataChannel created by PrepareBridgeSCTP to open
+// (after ICE/DTLS completes via Accept), then wraps it as the bridge.
+func (s *Session) WaitBridgeSCTP(ctx context.Context) error {
+	s.bridgeMu.Lock()
+	if s.bridge != nil {
+		s.bridgeMu.Unlock()
+		return nil
+	}
+	dc := s.sctpDC
+	ready := s.sctpReady
+	s.bridgeMu.Unlock()
+
+	if dc == nil || ready == nil {
+		return fmt.Errorf("call PrepareBridgeSCTP before WaitBridgeSCTP")
+	}
 
 	select {
-	case <-opened:
+	case <-ready:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -202,8 +228,19 @@ func (s *Session) OpenBridgeSCTP(ctx context.Context, pc *webrtc.PeerConnection)
 	br := colibri.WrapDataChannel(dc)
 	s.bridgeMu.Lock()
 	s.bridge = br
+	s.sctpDC = nil
+	s.sctpReady = nil
 	s.bridgeMu.Unlock()
 	return nil
+}
+
+// OpenBridgeSCTP is a convenience that calls PrepareBridgeSCTP + WaitBridgeSCTP.
+// Only use this if the PC has NOT yet done Accept (DC must be in SDP).
+func (s *Session) OpenBridgeSCTP(ctx context.Context, pc *webrtc.PeerConnection) error {
+	if err := s.PrepareBridgeSCTP(pc); err != nil {
+		return err
+	}
+	return s.WaitBridgeSCTP(ctx)
 }
 
 func strPtr(s string) *string { return &s }

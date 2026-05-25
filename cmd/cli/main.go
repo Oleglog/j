@@ -673,7 +673,6 @@ func readLines(ctx context.Context) <-chan string {
 
 // openBridgeAuto opens the bridge channel using colibri-ws if available,
 // otherwise falls back to SCTP datachannel via a new PeerConnection.
-// Returns a cleanup function for the PC (nil if colibri-ws was used).
 func openBridgeAuto(ctx context.Context, sess *j.Session) error {
 	if sess.ColibriWS != "" {
 		if err := sess.OpenBridge(ctx); err != nil {
@@ -687,15 +686,22 @@ func openBridgeAuto(ctx context.Context, sess *j.Session) error {
 	if err != nil {
 		return fmt.Errorf("new pc: %w", err)
 	}
+	// 1. Create DC before Accept so it's in the SDP answer
+	if err := sess.PrepareBridgeSCTP(pc); err != nil {
+		_ = pc.Close()
+		return fmt.Errorf("prepare sctp: %w", err)
+	}
+	// 2. Accept sends session-accept with DC in SDP, starts ICE
 	neg := sess.Negotiator()
 	neg.PC = pc
 	if err := neg.Accept(ctx); err != nil {
 		_ = pc.Close()
 		return fmt.Errorf("accept: %w", err)
 	}
-	if err := sess.OpenBridgeSCTP(ctx, pc); err != nil {
+	// 3. Wait for DC to open (after ICE/DTLS completes)
+	if err := sess.WaitBridgeSCTP(ctx); err != nil {
 		_ = pc.Close()
-		return fmt.Errorf("sctp: %w", err)
+		return fmt.Errorf("wait sctp: %w", err)
 	}
 	fmt.Fprintln(os.Stderr, "bridge connected (sctp)")
 	return nil

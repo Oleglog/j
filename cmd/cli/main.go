@@ -33,6 +33,7 @@ func main() {
 	benchSize := flag.Int("bench-size", 8192, "(bench) payload size per message in bytes")
 	benchSecs := flag.Int("bench-secs", 30, "(bench) duration of the benchmark in seconds")
 	timeout := flag.Duration("timeout", 5*time.Minute, "Timeout waiting for Jingle session")
+	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification")
 	flag.Parse()
 
 	if *host == "" || *room == "" {
@@ -47,27 +48,27 @@ func main() {
 
 	switch {
 	case *benchXMPP:
-		runBenchXMPP(ctx, *host, *room, *nick, *debug, *benchSize, *benchSecs)
+		runBenchXMPP(ctx, *host, *room, *nick, *debug, *insecure, *benchSize, *benchSecs)
 	case *bench:
-		runBench(ctx, *host, *room, *nick, *debug, *timeout, *benchSize, *benchSecs)
+		runBench(ctx, *host, *room, *nick, *debug, *insecure, *timeout, *benchSize, *benchSecs)
 	case *media:
-		runMedia(ctx, *host, *room, *nick, *debug, *timeout, *sendVideo)
+		runMedia(ctx, *host, *room, *nick, *debug, *insecure, *timeout, *sendVideo)
 	case *dcRaw:
-		runDCRaw(ctx, *host, *room, *nick, *debug, *timeout)
+		runDCRaw(ctx, *host, *room, *nick, *debug, *insecure, *timeout)
 	case *dc:
-		runDC(ctx, *host, *room, *nick, *debug, *timeout)
+		runDC(ctx, *host, *room, *nick, *debug, *insecure, *timeout)
 	case *chat:
-		runChat(ctx, *host, *room, *nick, *debug, *timeout)
+		runChat(ctx, *host, *room, *nick, *debug, *insecure, *timeout)
 	default:
-		runJingle(ctx, *host, *room, *nick, *debug, *timeout)
+		runJingle(ctx, *host, *room, *nick, *debug, *insecure, *timeout)
 	}
 }
 
-func runChat(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration) {
+func runChat(ctx context.Context, host, room, nick string, debug, insecure bool, timeout time.Duration) {
 	jctx, jcancel := context.WithTimeout(ctx, timeout)
 	defer jcancel()
 
-	sess, err := j.JoinMUC(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
+	sess, err := j.JoinMUC(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug, Insecure: insecure})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -118,11 +119,11 @@ func runChat(ctx context.Context, host, room, nick string, debug bool, timeout t
 	}
 }
 
-func runJingle(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration) {
+func runJingle(ctx context.Context, host, room, nick string, debug, insecure bool, timeout time.Duration) {
 	ctx, tcancel := context.WithTimeout(ctx, timeout)
 	defer tcancel()
 
-	sess, err := j.Join(ctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
+	sess, err := j.Join(ctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug, Insecure: insecure})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -165,12 +166,12 @@ func printServerAuth(sess *j.Session) {
 }
 
 // runDC: text broadcast over bridge channel. Each line of stdin → EndpointMessage{text:line}.
-func runDC(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration) {
+func runDC(ctx context.Context, host, room, nick string, debug, insecure bool, timeout time.Duration) {
 	jctx, jcancel := context.WithTimeout(ctx, timeout)
 	defer jcancel()
 
 	fmt.Fprintln(os.Stderr, "waiting for jingle session-initiate (needs 2nd participant in room)...")
-	sess, err := j.Join(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
+	sess, err := j.Join(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug, Insecure: insecure})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -214,12 +215,12 @@ func runDC(ctx context.Context, host, room, nick string, debug bool, timeout tim
 // runDCRaw: pipe arbitrary binary through the bridge.
 //
 //	stdin (binary) → SendRaw broadcast → other endpoint receives → DecodeRaw → stdout
-func runDCRaw(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration) {
+func runDCRaw(ctx context.Context, host, room, nick string, debug, insecure bool, timeout time.Duration) {
 	jctx, jcancel := context.WithTimeout(ctx, timeout)
 	defer jcancel()
 
 	fmt.Fprintln(os.Stderr, "waiting for jingle session-initiate (needs 2nd participant in room)...")
-	sess, err := j.Join(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
+	sess, err := j.Join(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug, Insecure: insecure})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -268,12 +269,12 @@ func runDCRaw(ctx context.Context, host, room, nick string, debug bool, timeout 
 	}
 }
 
-func runMedia(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration, sendVideo bool) {
+func runMedia(ctx context.Context, host, room, nick string, debug, insecure bool, timeout time.Duration, sendVideo bool) {
 	jctx, jcancel := context.WithTimeout(ctx, timeout)
 	defer jcancel()
 
 	fmt.Fprintln(os.Stderr, "joining and waiting for jingle session-initiate...")
-	sess, err := j.Join(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
+	sess, err := j.Join(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug, Insecure: insecure})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -470,12 +471,12 @@ func dummyVP8Keyframe() []byte {
 
 // runBench measures colibri-ws throughput. Bot 1 (this) sends, bot 2 (also -bench)
 // receives. Stats printed every 2s plus a final summary.
-func runBench(ctx context.Context, host, room, nick string, debug bool, timeout time.Duration, payloadSize, secs int) {
+func runBench(ctx context.Context, host, room, nick string, debug, insecure bool, timeout time.Duration, payloadSize, secs int) {
 	jctx, jcancel := context.WithTimeout(ctx, timeout)
 	defer jcancel()
 
 	fmt.Fprintln(os.Stderr, "joining and waiting for jingle session-initiate...")
-	sess, err := j.Join(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
+	sess, err := j.Join(jctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug, Insecure: insecure})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -556,9 +557,9 @@ func runBench(ctx context.Context, host, room, nick string, debug bool, timeout 
 // Path: client → wss://host/xmpp-websocket → prosody → other clients in MUC.
 // Each message is a <message type="groupchat"><body>BASE64</body></message> stanza.
 // Stanza size limit on cryptopro Prosody = 256 KB.
-func runBenchXMPP(ctx context.Context, host, room, nick string, debug bool, payloadSize, secs int) {
+func runBenchXMPP(ctx context.Context, host, room, nick string, debug, insecure bool, payloadSize, secs int) {
 	fmt.Fprintln(os.Stderr, "joining MUC (XMPP-only, no Jingle)...")
-	sess, err := j.JoinMUC(ctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug})
+	sess, err := j.JoinMUC(ctx, j.Config{Host: host, Room: room, Nick: nick, Debug: debug, Insecure: insecure})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

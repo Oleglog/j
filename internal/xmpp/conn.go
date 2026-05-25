@@ -3,6 +3,7 @@ package xmpp
 import (
 	"context"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/xml"
 	"fmt"
@@ -97,11 +98,16 @@ var jitsiMeetFeatures = []string{
 
 var jitsiCapsVersion = calculateJitsiCapsVersion()
 
-func Dial(ctx context.Context, host, room string, debug bool) (*Conn, error) {
+func Dial(ctx context.Context, host, room string, debug, insecure bool) (*Conn, error) {
 	url := fmt.Sprintf("wss://%s/xmpp-websocket?room=%s", host, room)
+	var httpClient *http.Client
+	if insecure {
+		httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	}
 	ws, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
 		Subprotocols:    []string{"xmpp"},
 		CompressionMode: websocket.CompressionContextTakeover,
+		HTTPClient:      httpClient,
 		HTTPHeader: http.Header{
 			"Accept":          {"*/*"},
 			"Accept-Language": {"en-US,en;q=0.9"},

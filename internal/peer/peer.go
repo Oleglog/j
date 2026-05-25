@@ -321,8 +321,8 @@ func bumpSDPVersion(sdp string) string {
 			parts := strings.Fields(line)
 			if len(parts) >= 4 {
 				// parts[2] is the session version
-				ver := 0
-				fmt.Sscanf(parts[2], "%d", &ver)
+				var ver int
+				_, _ = fmt.Sscanf(parts[2], "%d", &ver)
 				parts[2] = fmt.Sprintf("%d", ver+1)
 				lines[i] = strings.Join(parts, " ")
 			}

@@ -234,25 +234,10 @@ func (s *Session) WaitBridgeSCTP(ctx context.Context) error {
 	return nil
 }
 
-// OpenBridgeSCTP is a convenience that calls PrepareBridgeSCTP + WaitBridgeSCTP.
-// Only use this if the PC has NOT yet done Accept (DC must be in SDP).
-func (s *Session) OpenBridgeSCTP(ctx context.Context, pc *webrtc.PeerConnection) error {
-	if err := s.PrepareBridgeSCTP(pc); err != nil {
-		return err
-	}
-	return s.WaitBridgeSCTP(ctx)
-}
-
 func strPtr(s string) *string { return &s }
 
 // SetBridge sets an externally-provided Bridge (e.g. SCTP DataChannel wrapper).
-func (s *Session) SetBridge(br colibri.Bridge) {
-	s.bridgeMu.Lock()
-	defer s.bridgeMu.Unlock()
-	s.bridge = br
-}
-
-// Bridge returns the underlying bridge connection (after OpenBridge or SetBridge).
+// Bridge returns the underlying bridge connection (after OpenBridge or WaitBridgeSCTP).
 func (s *Session) Bridge() colibri.Bridge {
 	s.bridgeMu.Lock()
 	defer s.bridgeMu.Unlock()

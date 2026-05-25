@@ -158,7 +158,7 @@ func fetchMUCDomain(host string, insecure bool) string {
 	if err != nil {
 		return "conference." + host
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	buf := make([]byte, 64*1024)
 	n, _ := resp.Body.Read(buf)
 	body := string(buf[:n])

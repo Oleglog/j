@@ -21,15 +21,20 @@ No hardcoded addresses/rooms — everything is user-supplied.
 ## Features
 
 - Anonymous SASL → XMPP MUC join → focus → Jingle session-initiate
+- Auto-discovery of MUC domain from server `config.js` (works with both `conference.host` and `muc.host`)
 - Full Jingle XML ↔ SDP converter (BUNDLE, RTP payload-types, RTCP-FB, SSRC, fingerprint, ICE candidates, rtcp-mux filtering)
 - Binds `*webrtc.PeerConnection` (pion) to Jingle session: automatic session-accept, **trickle ICE**, **reconnect** on `session-terminate moving`
 - **Sending sendonly video track** (included in session-accept SDP, Jicofo distributes to other participants)
 - **Receiving video**: `RequestVideo(ctx, maxHeight)` — sends `ReceiverVideoConstraints` via bridge channel (without this JVB will NOT forward video!)
 - **Plan B detection**: `Negotiator.Accept` detects Plan B offers, `peer.IsPlanBError(err)` for handling
 - `source-add` / `source-remove` / `transport-info` / `session-terminate` helpers
-- colibri-ws (modern Jitsi data channel) — broadcast/unicast `EndpointMessage`, **raw bytes** via base64
+- **Bridge channel with two transports** (selected automatically based on what server offers):
+  - **colibri-ws** (modern, default for new deployments) — WebSocket to JVB
+  - **SCTP datachannel** (legacy, used by older Jitsi deployments) — pion DataChannel to JVB
+  - Both share the same `colibri.Bridge` interface — broadcast/unicast `EndpointMessage`, **raw bytes** via base64
 - Groupchat, raise/lower hand, leave
 - Low-level XMPP API (`Send(rawXML)`, `SendJingle`, `NextID`, `LastJingleStanza`)
+- `-insecure` flag to skip TLS verification (handy for self-signed certs in testing)
 - CLI with 6 modes for testing and benchmarking
 
 ## colibri-ws Throughput (via JVB)
@@ -67,20 +72,38 @@ WebSocket wss://host/xmpp-websocket?room=ROOM   (subprotocol: xmpp)
    ├─ extdisco:2 → TURN/STUN credentials
    ├─ focus.host conference allocation
    ├─ MUC join (presence + codecList + SourceInfo + nick + caps)
-   ├─ ← Jingle session-initiate (SDP-as-XML, ICE candidates, colibri-ws URL)
+   ├─ ← Jingle session-initiate (SDP-as-XML, ICE candidates, colibri-ws URL or SCTP map)
    ├─ → Jingle session-accept (with pion-generated SDP→Jingle)
    ├─ → Jingle transport-info (trickle late candidates)
    ├─ → Jingle source-add / source-remove (for late tracks)
    ├─ ← Jingle session-terminate (reason="moving" → reconnect)
    │
-   └─ ─── colibri-ws (bridge channel WebSocket) ──→ JVB
-                ├─ ClientHello / ServerHello
-                ├─ EndpointMessage (broadcast or unicast — arbitrary JSON payload)
-                ├─ EndpointStats / DominantSpeaker / LastN / VideoType / …
-                └─ raw bytes via base64 in EndpointMessage
+   └─ Bridge channel (one of):
+      │
+      ├─ colibri-ws (wss URL from session-initiate) ──→ JVB
+      │      ClientHello / ServerHello / EndpointMessage / EndpointStats / …
+      │
+      └─ SCTP datachannel (pion DataChannel "JVB data channel") ──→ JVB
+             Same JSON protocol, but transport is dc.SendText() (NOT binary!)
+             — JVB only processes DataChannelStringMessage, ignores binary frames.
 ```
 
 ## Usage
+
+### Config
+
+```go
+type Config struct {
+    Host     string  // Jitsi host, e.g. "meet.example.com"
+    Room     string  // room name (no @domain)
+    Nick     string  // display name
+    Debug    bool    // verbose XMPP/WS logging
+    Insecure bool    // skip TLS verification (self-signed / expired certs)
+}
+```
+
+`Host` is enough — j fetches `https://<host>/config.js` to discover the actual MUC
+domain (`muc.host` or `conference.host`). Override with `-debug` to see the choice.
 
 ### Chat / MUC
 
@@ -101,12 +124,43 @@ for m := range sess.Messages() {
 
 ### Bridge channel (JVB data channel)
 
+The bridge channel carries control/data messages between participants and JVB.
+`j` supports both transports automatically — pick the one your server uses.
+
+#### colibri-ws (modern, default)
+
 ```go
 sess, _ := j.Join(ctx, j.Config{...})           // waits for Jingle (needs ≥1 other participant)
 defer sess.Close()
 
-sess.OpenBridge(ctx)
+if sess.ColibriWS != "" {
+    sess.OpenBridge(ctx)  // dials wss://<jvb>/colibri-ws/...
+}
+```
 
+#### SCTP datachannel (legacy)
+
+If `sess.ColibriWS` is empty, the server uses SCTP. The DataChannel must be
+created **before** `Negotiator.Accept` so it ends up in the SDP answer:
+
+```go
+pc, _ := webrtc.NewPeerConnection(sess.IceConfig())
+
+// 1. Create DC before Accept (so it's in the SDP)
+sess.PrepareBridgeSCTP(pc)
+
+// 2. Negotiate SDP / send session-accept
+neg := sess.Negotiator()
+neg.PC = pc
+neg.Accept(ctx)
+
+// 3. Wait for DC to open + ServerHello from JVB
+sess.WaitBridgeSCTP(ctx)
+```
+
+#### Sending and receiving (same API for both)
+
+```go
 // raw bytes — broadcast to all
 sess.BridgeSendRaw("", []byte{0xDE, 0xAD, 0xBE, 0xEF})
 // unicast to specific endpoint
@@ -122,13 +176,11 @@ for m := range sess.BridgeMessages() {
 }
 ```
 
-Low-level bridge:
+Low-level bridge (works with both transports via `colibri.Bridge` interface):
 ```go
 br := sess.Bridge()
 br.SendLastN(8)
 br.SendVideoType("camera")        // "camera" | "desktop" | "none"
-br.SendEndpointStats(map[string]any{"bitrate": 1234, "jvbRTT": 12})
-br.SendReceiverAudioSubscription("Include", []string{"alice-a0"})
 br.SendReceiverVideoConstraints(map[string]any{ /* … */ })
 br.SendJSON(anyJSONserialisable)
 ```
@@ -307,6 +359,7 @@ go build -o jcli ./cmd/cli
 -room           room name
 -nick           display name
 -debug          verbose XMPP/WS logging
+-insecure       skip TLS certificate verification (self-signed / expired certs)
 -timeout 5m     how long to wait for Jingle session-initiate
 ```
 

@@ -13,8 +13,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -35,7 +37,7 @@ type Conn struct {
 	closeOnce sync.Once
 }
 
-const defaultSendQueue = 1024
+const defaultSendQueue = 4096
 
 // Message is any incoming bridge channel message. RawJSON is the original JSON, Class is the
 // colibriClass attribute, Fields holds parsed top-level JSON fields (so callers can read e.g.
@@ -58,8 +60,8 @@ func Dial(ctx context.Context, url string) (*Conn, error) {
 	c := &Conn{
 		ws:       ws,
 		url:      url,
-		incoming: make(chan Message, 64),
-		rawIn:    make(chan []byte, 256),
+		incoming: make(chan Message, 256),
+		rawIn:    make(chan []byte, 1024),
 		outgoing: make(chan []byte, defaultSendQueue),
 		closed:   make(chan struct{}),
 	}
@@ -125,7 +127,18 @@ func (c *Conn) readLoop() {
 			case <-c.closed:
 				return
 			default:
-				// drop on overflow — caller is too slow
+				// Consumer is slow. Block briefly rather than dropping —
+				// smux assumes a reliable transport and losing even one
+				// frame corrupts the entire multiplexed session.
+				select {
+				case c.rawIn <- cp:
+				case <-c.closed:
+					return
+				case <-time.After(5 * time.Second):
+					// 5 s is generous; if the consumer is stuck that long
+					// the session is likely dead anyway. Drop + log.
+					log.Printf("colibri: dropped raw frame after 5s block (consumer stuck)")
+				}
 			}
 			continue
 		}

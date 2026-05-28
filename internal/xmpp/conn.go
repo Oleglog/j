@@ -1,12 +1,14 @@
 package xmpp
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sort"
@@ -18,8 +20,33 @@ import (
 	"github.com/coder/websocket"
 )
 
+// transport abstracts the underlying XMPP framing connection (WebSocket or BOSH).
+type transport interface {
+	Send([]byte) error
+	Recv(ctx context.Context) ([]byte, error)
+	Close() error
+}
+
+// wsTransport wraps a WebSocket connection.
+type wsTransport struct {
+	ws *websocket.Conn
+}
+
+func (t *wsTransport) Send(data []byte) error {
+	return t.ws.Write(context.Background(), websocket.MessageText, data)
+}
+
+func (t *wsTransport) Recv(ctx context.Context) ([]byte, error) {
+	_, data, err := t.ws.Read(ctx)
+	return data, err
+}
+
+func (t *wsTransport) Close() error {
+	return t.ws.Close(websocket.StatusNormalClosure, "")
+}
+
 type Conn struct {
-	ws        *websocket.Conn
+	tr        transport
 	host      string
 	room      string
 	mucDomain string // e.g. "muc.meet1.arbitr.ru" or "conference.meet1.arbitr.ru"
@@ -28,6 +55,7 @@ type Conn struct {
 	nick      string
 	debug     bool
 	anonymous bool
+	bosh      bool // true when using BOSH transport (no stream management)
 	focusInfo FocusInfo
 	mu        sync.Mutex
 	ackH      atomic.Int64
@@ -101,12 +129,25 @@ var jitsiMeetFeatures = []string{
 var jitsiCapsVersion = calculateJitsiCapsVersion()
 
 func Dial(ctx context.Context, host, room string, debug, insecure bool) (*Conn, error) {
-	url := fmt.Sprintf("wss://%s/xmpp-websocket?room=%s", host, room)
 	var httpClient *http.Client
 	if insecure {
 		httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 	}
-	ws, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
+
+	cfg := fetchConfig(host, insecure)
+
+	wsURL := cfg.websocket
+	if wsURL == "" {
+		wsURL = fmt.Sprintf("wss://%s/xmpp-websocket", host)
+	}
+	// Append room query param if not already present.
+	if !strings.Contains(wsURL, "?") {
+		wsURL += "?room=" + room
+	} else {
+		wsURL += "&room=" + room
+	}
+
+	ws, _, wsErr := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		Subprotocols:    []string{"xmpp"},
 		CompressionMode: websocket.CompressionContextTakeover,
 		HTTPClient:      httpClient,
@@ -122,18 +163,21 @@ func Dial(ctx context.Context, host, room string, debug, insecure bool) (*Conn, 
 			"User-Agent":      {"Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0"},
 		},
 	})
-	if err != nil {
-		return nil, err
+	if wsErr != nil {
+		// BOSH fallback: if WebSocket dial failed and we have a BOSH URL, try BOSH.
+		if cfg.bosh != "" {
+			return dialBOSH(ctx, host, room, debug, insecure, cfg)
+		}
+		return nil, fmt.Errorf("failed to WebSocket dial: %w", wsErr)
 	}
 	ws.SetReadLimit(1 << 20)
 
-	mucDomain, xmppDomain := fetchConfig(host, insecure)
 	c := &Conn{
-		ws:         ws,
+		tr:         &wsTransport{ws: ws},
 		host:       host,
 		room:       room,
-		mucDomain:  mucDomain,
-		xmppDomain: xmppDomain,
+		mucDomain:  cfg.mucDomain,
+		xmppDomain: cfg.xmppDomain,
 		debug:      debug,
 		occupants:  make(map[string]struct{}),
 		stanzas:    make(chan string, 64),
@@ -152,43 +196,45 @@ func Dial(ctx context.Context, host, room string, debug, insecure bool) (*Conn, 
 	return c, nil
 }
 
-// fetchConfig downloads /config.js from the host and extracts the MUC and
-// XMPP domains. It supports both Jitsi config formats:
-//
-//	config.hosts.domain = 'meet.jitsi'   (docker-jitsi-meet)
-//	config.hosts.muc = 'muc.' + subdomain + 'meet.jitsi'
-//
-// and the inline form:
-//
-//	{ domain: 'meet.example.com', muc: 'conference.meet.example.com' }
-//
-// String concatenation is handled by joining all string literals on the right
-// side and ignoring identifiers (subdomain is typically an empty string).
-//
-// Returns (mucDomain, xmppDomain). Falls back to "conference."+host and host
-// respectively if config.js is unreachable or unparseable.
-func fetchConfig(host string, insecure bool) (mucDomain, xmppDomain string) {
-	mucDomain = "conference." + host
-	xmppDomain = host
+type jitsiConfig struct {
+	mucDomain  string
+	xmppDomain string
+	websocket  string // full wss:// URL from config.websocket (without room param)
+	bosh       string // full URL from config.bosh
+}
+
+// fetchConfig downloads /config.js from the host and extracts MUC domain,
+// XMPP domain, WebSocket URL, and BOSH URL.
+func fetchConfig(host string, insecure bool) jitsiConfig {
+	cfg := jitsiConfig{
+		mucDomain:  "conference." + host,
+		xmppDomain: host,
+	}
 	client := http.DefaultClient
 	if insecure {
 		client = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 	}
 	resp, err := client.Get("https://" + host + "/config.js")
 	if err != nil {
-		return
+		return cfg
 	}
 	defer func() { _ = resp.Body.Close() }()
 	buf := make([]byte, 64*1024)
 	n, _ := resp.Body.Read(buf)
 	body := string(buf[:n])
 	if v := extractStringField(body, "domain"); v != "" {
-		xmppDomain = v
+		cfg.xmppDomain = v
 	}
 	if v := extractStringField(body, "muc"); v != "" {
-		mucDomain = v
+		cfg.mucDomain = v
 	}
-	return
+	if v := extractStringField(body, "websocket"); v != "" {
+		cfg.websocket = v
+	}
+	if v := extractStringField(body, "bosh"); v != "" {
+		cfg.bosh = v
+	}
+	return cfg
 }
 
 // extractStringField finds `<key>: <expr>` or `<key> = <expr>` in JS source
@@ -295,6 +341,10 @@ func (c *Conn) Stanzas() <-chan string { return c.stanzas }
 // to be invisible in the protocol log. 10s ack window covers the
 // worst-case meet.cryptopro.ru round trip we've measured.
 func (c *Conn) keepaliveLoop() {
+	if c.bosh {
+		// BOSH uses HTTP polling; stream management is not applicable.
+		return
+	}
 	const (
 		interval = 30 * time.Second
 		ackWait  = 10 * time.Second
@@ -343,18 +393,15 @@ func (c *Conn) keepaliveLoop() {
 			}
 			c.waitMu.Unlock()
 			c.markClosed()
-			_ = c.ws.Close(websocket.StatusGoingAway, "keepalive timeout")
+			_ = c.tr.Close()
 			return
 		}
 	}
 }
 
 func (c *Conn) Close() error {
-	// markClosed is the only place that flips c.closed. Use a sync.Once
-	// because both Close() and the readLoop's deferred close path can
-	// race to mark the connection dead, and we want at most one close.
 	c.markClosed()
-	return c.ws.Close(websocket.StatusNormalClosure, "")
+	return c.tr.Close()
 }
 
 // markClosed signals all waiters (LeaveMUCWait, SendIQWait, keepalive,
@@ -364,11 +411,6 @@ func (c *Conn) markClosed() {
 }
 
 func (c *Conn) send(s string) error {
-	// Refuse writes once the connection has been declared dead so
-	// callers see an immediate error instead of having their bytes
-	// silently swallowed by a half-shut websocket. This is what makes
-	// LeaveMUCWait return promptly on a dead Prosody link instead of
-	// burning its full 5s timeout.
 	select {
 	case <-c.closed:
 		return fmt.Errorf("xmpp connection closed")
@@ -379,9 +421,7 @@ func (c *Conn) send(s string) error {
 	if c.debug {
 		fmt.Fprintf(os.Stderr, "[xmpp] -> %s\n", s)
 	}
-	if err := c.ws.Write(context.Background(), websocket.MessageText, []byte(s)); err != nil {
-		// Write failure means the websocket is gone. Mark closed so
-		// any goroutine still blocked on c.closed wakes up.
+	if err := c.tr.Send([]byte(s)); err != nil {
 		c.markClosed()
 		return err
 	}
@@ -389,7 +429,7 @@ func (c *Conn) send(s string) error {
 }
 
 func (c *Conn) readOne(ctx context.Context) (string, error) {
-	_, data, err := c.ws.Read(ctx)
+	data, err := c.tr.Recv(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -478,7 +518,14 @@ func (c *Conn) readLoop() {
 			continue
 		}
 
+		// Ack any incoming IQ type="set" that is NOT session-initiate (handled below)
+		// and NOT disco#info (handled above). This covers source-add, source-remove, etc.
+		if isIQSet(msg) && !isSessionInitiate(msg) {
+			c.ackIQ(msg)
+		}
+
 		if isSessionInitiate(msg) {
+			c.ackIQ(msg) // XMPP requires IQ result for incoming IQ set
 			c.lastJngMu.Lock()
 			c.lastJng = msg
 			c.lastJngMu.Unlock()
@@ -958,6 +1005,20 @@ func isIQError(msg string) bool {
 	return strings.HasPrefix(msg, "<iq") && extractXMLAttr(msg, "type") == "error"
 }
 
+func isIQSet(msg string) bool {
+	return strings.HasPrefix(msg, "<iq") && extractXMLAttr(msg, "type") == "set"
+}
+
+// ackIQ sends an <iq type="result"/> for an incoming IQ type="set".
+func (c *Conn) ackIQ(msg string) {
+	from := extractXMLAttr(msg, "from")
+	id := extractXMLAttr(msg, "id")
+	if from == "" || id == "" {
+		return
+	}
+	_ = c.send(fmt.Sprintf(`<iq to="%s" id="%s" type="result" xmlns="jabber:client"/>`, from, id))
+}
+
 // isOwnPresenceUnavailable matches the broadcast Prosody sends back to us
 // when our MUC presence unavailable has been processed: from is our own
 // MUC JID with type="unavailable". This is what fires LeaveMUCWait.
@@ -1059,4 +1120,335 @@ func xmlEscape(s string) string {
 	var b strings.Builder
 	_ = xml.EscapeText(&b, []byte(s))
 	return b.String()
+}
+
+// --- BOSH transport (XEP-0124 / XEP-0206) ---
+
+// boshTransport implements the transport interface over BOSH (HTTP long-polling).
+type boshTransport struct {
+	url    string
+	client *http.Client
+	sid    string
+	rid    atomic.Int64
+	mu     sync.Mutex
+	inbox  chan []byte // stanzas received from server
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newBOSHTransport(boshURL string, insecure bool) *boshTransport {
+	client := http.DefaultClient
+	if insecure {
+		client = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	}
+	bt := &boshTransport{
+		url:    boshURL,
+		client: client,
+		inbox:  make(chan []byte, 64),
+		closed: make(chan struct{}),
+	}
+	bt.rid.Store(time.Now().UnixNano() % 1000000)
+	return bt
+}
+
+func (bt *boshTransport) nextRID() int64 {
+	return bt.rid.Add(1)
+}
+
+// init sends the BOSH session-creation request and starts the long-poll loop.
+func (bt *boshTransport) init(xmppDomain string) error {
+	rid := bt.nextRID()
+	body := fmt.Sprintf(
+		`<body rid="%d" to="%s" xml:lang="en" wait="60" hold="1" content="text/xml; charset=utf-8" ver="1.6" xmpp:version="1.0" xmlns="http://jabber.org/protocol/httpbind" xmlns:xmpp="urn:xmpp:xbosh"/>`,
+		rid, xmppDomain)
+
+	respBody, err := bt.post(body)
+	if err != nil {
+		return fmt.Errorf("bosh init: %w", err)
+	}
+
+	// Extract sid from response <body sid="..." ...>
+	sid := extractXMLAttr(string(respBody), "sid")
+	if sid == "" {
+		return fmt.Errorf("bosh init: no sid in response: %s", string(respBody))
+	}
+	bt.sid = sid
+
+	// Extract stanzas from the initial response body
+	bt.extractAndQueue(respBody)
+
+	// Start long-poll loop
+	go bt.pollLoop()
+	return nil
+}
+
+func (bt *boshTransport) post(body string) ([]byte, error) {
+	req, err := http.NewRequest("POST", bt.url, bytes.NewBufferString(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "text/xml; charset=utf-8")
+	resp, err := bt.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("bosh: HTTP %d: %s", resp.StatusCode, string(data))
+	}
+	return data, nil
+}
+
+// extractAndQueue pulls child stanzas from a <body>...</body> response and queues them.
+func (bt *boshTransport) extractAndQueue(data []byte) {
+	s := string(data)
+	// Strip outer <body ...>...</body> wrapper to get inner stanzas.
+	// Find end of opening <body ...> tag
+	inner := extractBOSHInner(s)
+	if inner == "" {
+		return
+	}
+	// Split into individual top-level elements (stanzas).
+	// Simple approach: each stanza starts with '<' at depth 0.
+	stanzas := splitXMLElements(inner)
+	for _, st := range stanzas {
+		st = strings.TrimSpace(st)
+		if st == "" {
+			continue
+		}
+		select {
+		case bt.inbox <- []byte(st):
+		case <-bt.closed:
+			return
+		}
+	}
+}
+
+func (bt *boshTransport) pollLoop() {
+	for {
+		select {
+		case <-bt.closed:
+			return
+		default:
+		}
+		rid := bt.nextRID()
+		body := fmt.Sprintf(
+			`<body rid="%d" sid="%s" xmlns="http://jabber.org/protocol/httpbind"/>`,
+			rid, bt.sid)
+		respData, err := bt.post(body)
+		if err != nil {
+			bt.once.Do(func() { close(bt.closed) })
+			return
+		}
+		// Check for terminate
+		if strings.Contains(string(respData), `type="terminate"`) || strings.Contains(string(respData), `type='terminate'`) {
+			bt.once.Do(func() { close(bt.closed) })
+			return
+		}
+		bt.extractAndQueue(respData)
+	}
+}
+
+func (bt *boshTransport) Send(data []byte) error {
+	select {
+	case <-bt.closed:
+		return fmt.Errorf("bosh connection closed")
+	default:
+	}
+	bt.mu.Lock()
+	defer bt.mu.Unlock()
+	rid := bt.nextRID()
+	body := fmt.Sprintf(
+		`<body rid="%d" sid="%s" xmlns="http://jabber.org/protocol/httpbind">%s</body>`,
+		rid, bt.sid, string(data))
+	respData, err := bt.post(body)
+	if err != nil {
+		return err
+	}
+	bt.extractAndQueue(respData)
+	return nil
+}
+
+func (bt *boshTransport) Recv(ctx context.Context) ([]byte, error) {
+	select {
+	case data := <-bt.inbox:
+		return data, nil
+	case <-bt.closed:
+		return nil, fmt.Errorf("bosh connection closed")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (bt *boshTransport) Close() error {
+	bt.once.Do(func() { close(bt.closed) })
+	// Send terminate
+	bt.mu.Lock()
+	defer bt.mu.Unlock()
+	rid := bt.nextRID()
+	body := fmt.Sprintf(
+		`<body rid="%d" sid="%s" type="terminate" xmlns="http://jabber.org/protocol/httpbind"/>`,
+		rid, bt.sid)
+	_, _ = bt.post(body)
+	return nil
+}
+
+// dialBOSH creates a Conn using BOSH transport.
+func dialBOSH(ctx context.Context, host, room string, debug, insecure bool, cfg jitsiConfig) (*Conn, error) {
+	bt := newBOSHTransport(cfg.bosh, insecure)
+	if err := bt.init(cfg.xmppDomain); err != nil {
+		return nil, err
+	}
+
+	c := &Conn{
+		tr:         bt,
+		host:       host,
+		room:       room,
+		mucDomain:  cfg.mucDomain,
+		xmppDomain: cfg.xmppDomain,
+		debug:      debug,
+		bosh:       true,
+		occupants:  make(map[string]struct{}),
+		stanzas:    make(chan string, 64),
+		jingles:    make(chan string, 8),
+		closed:     make(chan struct{}),
+		iqWaiters:  make(map[string]chan string),
+	}
+
+	if err := c.authBOSH(ctx, bt); err != nil {
+		_ = bt.Close()
+		return nil, err
+	}
+
+	go c.readLoop()
+	go c.keepaliveLoop()
+	return c, nil
+}
+
+// authBOSH performs SASL ANONYMOUS + bind + session over BOSH.
+// The initial <body> already opened the stream; we just need to do SASL and bind.
+func (c *Conn) authBOSH(ctx context.Context, bt *boshTransport) error {
+	// Read initial features from the inbox (queued by init)
+	initialFeatures, err := c.readUntilReturn(ctx, "features")
+	if err != nil {
+		return fmt.Errorf("initial features: %w", err)
+	}
+	if !strings.Contains(initialFeatures, "<mechanism>ANONYMOUS</mechanism>") {
+		return fmt.Errorf("server does not advertise anonymous XMPP login")
+	}
+
+	// ANONYMOUS SASL
+	if err := c.send(`<auth mechanism="ANONYMOUS" xmlns="urn:ietf:params:xml:ns:xmpp-sasl"/>`); err != nil {
+		return err
+	}
+	if err := c.readUntil(ctx, "success"); err != nil {
+		return fmt.Errorf("sasl: %w", err)
+	}
+	c.anonymous = true
+
+	// Restart stream via BOSH
+	bt.mu.Lock()
+	rid := bt.nextRID()
+	body := fmt.Sprintf(
+		`<body rid="%d" sid="%s" to="%s" xml:lang="en" xmpp:restart="true" xmlns="http://jabber.org/protocol/httpbind" xmlns:xmpp="urn:xmpp:xbosh"/>`,
+		rid, bt.sid, c.xmppDomain)
+	respData, err := bt.post(body)
+	bt.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("bosh restart: %w", err)
+	}
+	bt.extractAndQueue(respData)
+
+	if err := c.readUntil(ctx, "features"); err != nil {
+		return fmt.Errorf("post-auth features: %w", err)
+	}
+
+	// bind
+	if err := c.send(`<iq type="set" id="bind_1" xmlns="jabber:client"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"/></iq>`); err != nil {
+		return err
+	}
+	bindResp, err := c.readUntilReturn(ctx, "<jid>")
+	if err != nil {
+		return fmt.Errorf("bind: %w", err)
+	}
+	c.jid = extractJID(bindResp)
+	if c.jid == "" {
+		return fmt.Errorf("bind failed: %s", bindResp)
+	}
+	parts := strings.Split(c.jid, "@")
+	if len(parts) > 0 && len(parts[0]) >= 8 {
+		c.nick = parts[0][:8]
+	}
+
+	// session
+	if err := c.send(`<iq type="set" id="sess_1" xmlns="jabber:client"><session xmlns="urn:ietf:params:xml:ns:xmpp-session"/></iq>`); err != nil {
+		return err
+	}
+	if err := c.readUntil(ctx, "sess_1"); err != nil {
+		return fmt.Errorf("session: %w", err)
+	}
+
+	return nil
+}
+
+// extractBOSHInner returns the content between <body ...> and </body>.
+func extractBOSHInner(s string) string {
+	// Find end of opening tag
+	start := strings.Index(s, ">")
+	if start == -1 {
+		return ""
+	}
+	// Check for self-closing <body ... />
+	if s[start-1] == '/' {
+		return ""
+	}
+	start++
+	end := strings.LastIndex(s, "</body>")
+	if end == -1 || end <= start {
+		return ""
+	}
+	return s[start:end]
+}
+
+// splitXMLElements splits a string of concatenated XML elements into individual elements.
+func splitXMLElements(s string) []string {
+	var result []string
+	depth := 0
+	start := -1
+	i := 0
+	for i < len(s) {
+		if s[i] == '<' {
+			if start == -1 {
+				start = i
+			}
+			// Check for self-closing or closing tag
+			end := strings.IndexByte(s[i:], '>')
+			if end == -1 {
+				break
+			}
+			tag := s[i : i+end+1]
+			if strings.HasPrefix(tag, "</") {
+				depth--
+				if depth == 0 && start != -1 {
+					result = append(result, s[start:i+end+1])
+					start = -1
+				}
+			} else if strings.HasSuffix(tag, "/>") {
+				if depth == 0 {
+					result = append(result, s[start:i+end+1])
+					start = -1
+				}
+			} else {
+				depth++
+			}
+			i += end + 1
+		} else {
+			i++
+		}
+	}
+	return result
 }

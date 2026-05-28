@@ -408,7 +408,7 @@ func (s *Session) IceConfig() webrtc.Configuration {
 	}
 	return webrtc.Configuration{
 		ICEServers:         srvs,
-		ICETransportPolicy: webrtc.ICETransportPolicyRelay,
+		ICETransportPolicy: webrtc.ICETransportPolicyAll,
 	}
 }
 

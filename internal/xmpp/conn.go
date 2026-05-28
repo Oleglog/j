@@ -262,8 +262,12 @@ func extractStringField(body, key string) string {
 			continue
 		}
 		rest = strings.TrimLeft(rest, " \t:=")
-		// strip trailing comment / semicolon / comma — only the expression matters
-		if i := strings.IndexAny(rest, ";,/"); i >= 0 {
+		// strip trailing semicolon / comma
+		if i := strings.IndexAny(rest, ";,"); i >= 0 {
+			rest = rest[:i]
+		}
+		// strip JS line comment — but only outside string literals
+		if i := indexCommentOutsideStrings(rest); i >= 0 {
 			rest = rest[:i]
 		}
 		v := joinStringLiterals(rest)
@@ -272,6 +276,28 @@ func extractStringField(body, key string) string {
 		}
 	}
 	return ""
+}
+
+// indexCommentOutsideStrings finds "//" that is NOT inside a string literal.
+func indexCommentOutsideStrings(s string) int {
+	inStr := byte(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inStr != 0 {
+			if c == inStr {
+				inStr = 0
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			inStr = c
+			continue
+		}
+		if c == '/' && i+1 < len(s) && s[i+1] == '/' {
+			return i
+		}
+	}
+	return -1
 }
 
 // joinStringLiterals walks a JS expression and concatenates all single- or

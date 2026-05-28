@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -346,5 +347,143 @@ func feedVP8(ctx context.Context, track *webrtc.TrackLocalStaticSample) {
 		case <-tick.C:
 			_ = track.WriteSample(media.Sample{Data: frame, Duration: 33 * time.Millisecond})
 		}
+	}
+}
+
+// TestE2E_MultiHost runs a full connect+video test against many Jitsi instances.
+// Pass hosts via env: JITSI_HOSTS="host1,host2,host3"
+// Run: JITSI_HOSTS="meet.mamba.group,meet1.arbitr.ru" go test -tags e2e -v -timeout 600s -run TestE2E_MultiHost ./...
+func TestE2E_MultiHost(t *testing.T) {
+	hostsEnv := os.Getenv("JITSI_HOSTS")
+	if hostsEnv == "" {
+		t.Skip("JITSI_HOSTS not set")
+	}
+	var hosts []string
+	for _, h := range strings.Split(hostsEnv, ",") {
+		h = strings.TrimSpace(h)
+		if h != "" {
+			hosts = append(hosts, h)
+		}
+	}
+	if len(hosts) == 0 {
+		t.Skip("no hosts in JITSI_HOSTS")
+	}
+
+	for _, host := range hosts {
+		t.Run(host, func(t *testing.T) {
+			t.Parallel()
+			testFullFlow(t, host)
+		})
+	}
+}
+
+func testFullFlow(t *testing.T, host string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	room := fmt.Sprintf("j-test-%d", time.Now().UnixNano()%100000)
+	debug := testDebug()
+
+	type result struct {
+		sess *j.Session
+		err  error
+	}
+	ch1, ch2 := make(chan result, 1), make(chan result, 1)
+	go func() {
+		s, e := j.Join(ctx, j.Config{Host: host, Room: room, Nick: "t1", Debug: debug})
+		ch1 <- result{s, e}
+	}()
+	go func() {
+		s, e := j.Join(ctx, j.Config{Host: host, Room: room, Nick: "t2", Debug: debug})
+		ch2 <- result{s, e}
+	}()
+
+	r1 := <-ch1
+	if r1.err != nil {
+		t.Fatalf("FAIL connect: %v", r1.err)
+	}
+	sess1 := r1.sess
+	defer sess1.Close()
+
+	r2 := <-ch2
+	if r2.err != nil {
+		t.Fatalf("FAIL connect: %v", r2.err)
+	}
+	sess2 := r2.sess
+	defer sess2.Close()
+
+	t.Logf("OK connect+jingle")
+
+	// Bot1: send video (try VP8, fallback to H264)
+	pc1, err := webrtc.NewPeerConnection(sess1.IceConfig())
+	if err != nil {
+		t.Fatalf("pc1: %v", err)
+	}
+	defer pc1.Close()
+
+	codec := webrtc.MimeTypeVP8
+	vt, _ := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: codec, ClockRate: 90000}, "v", "s")
+	pc1.AddTrack(vt)
+	sess1.PrepareBridgeSCTP(pc1)
+	neg1 := sess1.Negotiator()
+	neg1.PC = pc1
+	if err := neg1.Accept(ctx); err != nil {
+		// VP8 not supported — retry with H264
+		pc1.Close()
+		pc1, _ = webrtc.NewPeerConnection(sess1.IceConfig())
+		defer pc1.Close()
+		codec = webrtc.MimeTypeH264
+		vt, _ = webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: codec, ClockRate: 90000, SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"}, "v", "s")
+		pc1.AddTrack(vt)
+		sess1.PrepareBridgeSCTP(pc1)
+		neg1 = sess1.Negotiator()
+		neg1.PC = pc1
+		if err := neg1.Accept(ctx); err != nil {
+			t.Skipf("SKIP: no supported video codec: %v", err)
+		}
+	}
+	go feedVP8(ctx, vt)
+
+	// Bot2: receive video
+	pc2, err := webrtc.NewPeerConnection(sess2.IceConfig())
+	if err != nil {
+		t.Fatalf("pc2: %v", err)
+	}
+	defer pc2.Close()
+
+	trackCh := make(chan *webrtc.TrackRemote, 4)
+	pc2.OnTrack(func(tr *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		select {
+		case trackCh <- tr:
+		default:
+		}
+	})
+	sess2.PrepareBridgeSCTP(pc2)
+	neg2 := sess2.Negotiator()
+	neg2.PC = pc2
+	if err := neg2.Accept(ctx); err != nil {
+		t.Fatalf("FAIL accept2: %v", err)
+	}
+
+	if err := sess2.WaitBridgeSCTP(ctx); err != nil {
+		t.Fatalf("FAIL bridge: %v", err)
+	}
+	sess2.RequestVideo(ctx, 720)
+
+	select {
+	case tr := <-trackCh:
+		buf := make([]byte, 1500)
+		for i := 0; i < 5; i++ {
+			if _, _, err := tr.Read(buf); err != nil {
+				t.Fatalf("FAIL read: %v", err)
+			}
+		}
+		t.Logf("OK video: %s ssrc=%d", tr.Codec().MimeType, tr.SSRC())
+	case <-ctx.Done():
+		t.Logf("bot1 ICE=%s PC=%s", pc1.ICEConnectionState(), pc1.ConnectionState())
+		t.Logf("bot2 ICE=%s PC=%s", pc2.ICEConnectionState(), pc2.ConnectionState())
+		t.Fatalf("FAIL video timeout")
 	}
 }

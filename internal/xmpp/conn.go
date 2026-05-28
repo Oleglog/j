@@ -229,9 +229,17 @@ func fetchConfig(host string, insecure bool) jitsiConfig {
 		cfg.mucDomain = v
 	}
 	if v := extractStringField(body, "websocket"); v != "" {
+		// Handle protocol-relative URLs like "//host/xmpp-websocket"
+		if strings.HasPrefix(v, "//") {
+			v = "wss:" + v
+		}
 		cfg.websocket = v
 	}
 	if v := extractStringField(body, "bosh"); v != "" {
+		// Handle protocol-relative URLs like "//host/http-bind"
+		if strings.HasPrefix(v, "//") {
+			v = "https:" + v
+		}
 		cfg.bosh = v
 	}
 	return cfg
@@ -843,8 +851,8 @@ func (c *Conn) AllocateFocus(ctx context.Context, room string) error {
 
 func (c *Conn) JoinMUC(ctx context.Context, room, displayName string) error {
 	roomJID := fmt.Sprintf("%s@%s/%s", room, c.mucDomain, c.nick)
-	presence := fmt.Sprintf(`<presence to="%s" xmlns="jabber:client"><x xmlns="http://jabber.org/protocol/muc"/><stats-id>%s</stats-id><c hash="sha-1" node="%s" ver="%s" xmlns="http://jabber.org/protocol/caps"/><SourceInfo>{}</SourceInfo><jitsi_participant_codecList>vp8,h264,av1,vp9</jitsi_participant_codecList><nick xmlns="http://jabber.org/protocol/nick">%s</nick></presence>`,
-		roomJID, displayName[:min(3, len(displayName))]+"-j", jitsiCapsNode, jitsiCapsVersion, displayName)
+	presence := fmt.Sprintf(`<presence to="%s" xmlns="jabber:client"><x xmlns="http://jabber.org/protocol/muc"/><stats-id>%s</stats-id><c hash="sha-1" node="%s" ver="%s" xmlns="http://jabber.org/protocol/caps"/><SourceInfo>{"%s-a0":{"muted":true},"%s-v0":{"muted":true}}</SourceInfo><jitsi_participant_codecList>vp8,h264,av1,vp9</jitsi_participant_codecList><nick xmlns="http://jabber.org/protocol/nick">%s</nick></presence>`,
+		roomJID, displayName[:min(3, len(displayName))]+"-j", jitsiCapsNode, jitsiCapsVersion, c.nick, c.nick, displayName)
 	if err := c.send(presence); err != nil {
 		return err
 	}

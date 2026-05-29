@@ -59,7 +59,11 @@ func WrapDataChannel(dc *webrtc.DataChannel) *SCTPBridge {
 		}
 	})
 	dc.OnClose(func() {
-		b.closeOnce.Do(func() { close(b.closed) })
+		b.closeOnce.Do(func() {
+			close(b.closed)
+			close(b.incoming)
+			close(b.rawIn)
+		})
 	})
 	return b
 }
@@ -151,6 +155,10 @@ func (b *SCTPBridge) PrependMessages(msgs []Message) {
 }
 
 func (b *SCTPBridge) Close() error {
-	b.closeOnce.Do(func() { close(b.closed) })
+	b.closeOnce.Do(func() {
+		close(b.closed)
+		close(b.incoming)
+		close(b.rawIn)
+	})
 	return b.dc.Close()
 }

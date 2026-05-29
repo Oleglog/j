@@ -406,13 +406,17 @@ func (s *Session) Rejoin(ctx context.Context, nick string) error {
 	s.bridgeMu.Unlock()
 
 	if err := s.Conn.LeaveMUCWait(s.room, 5*time.Second); err != nil {
+		log.Printf("j: rejoin leave-muc failed: %v (fire-and-forget)", err)
 		_ = s.Conn.LeaveMUC(s.room)
 		time.Sleep(200 * time.Millisecond)
+	} else {
+		log.Printf("j: rejoin leave-muc ok for room %s", s.room)
 	}
 
 	if nick == "" {
 		nick = s.Conn.Nick()
 	}
+	log.Printf("j: rejoin joining room %s as %s", s.room, nick)
 	return s.Conn.JoinMUC(ctx, s.room, nick)
 }
 

@@ -393,6 +393,29 @@ func (s *Session) Endpoints() []string {
 	return s.Conn.Occupants()
 }
 
+// Rejoin leaves the MUC and rejoins immediately WITHOUT waiting for
+// session-initiate. Use WaitJingleReinitiate after Rejoin to wait for
+// Jicofo to send a new session-initiate when another participant arrives.
+// This avoids blocking indefinitely when the server is alone in the room.
+func (s *Session) Rejoin(ctx context.Context, nick string) error {
+	s.bridgeMu.Lock()
+	if s.bridge != nil {
+		_ = s.bridge.Close()
+		s.bridge = nil
+	}
+	s.bridgeMu.Unlock()
+
+	if err := s.Conn.LeaveMUCWait(s.room, 5*time.Second); err != nil {
+		_ = s.Conn.LeaveMUC(s.room)
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if nick == "" {
+		nick = s.Conn.Nick()
+	}
+	return s.Conn.JoinMUC(ctx, s.room, nick)
+}
+
 // LowLevel returns the underlying XMPP connection so callers can issue raw XMPP/Jingle stanzas.
 func (s *Session) LowLevel() *xmpp.Conn { return s.Conn }
 

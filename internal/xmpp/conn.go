@@ -9,6 +9,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -51,6 +52,10 @@ type Conn struct {
 	room      string
 	mucDomain string // e.g. "muc.meet1.arbitr.ru" or "conference.meet1.arbitr.ru"
 	xmppDomain string // XMPP virtualhost — usually equals host, but docker-jitsi-meet uses "meet.jitsi"
+	// streamDomain is the vhost used for <open to="..."> and SASL.
+	// On meet.jit.si this is guest.meet.jit.si (anonymousdomain from
+	// config.js) while xmppDomain stays meet.jit.si for focus.* IQ.
+	streamDomain string
 	jid       string
 	nick      string
 	debug     bool
@@ -173,17 +178,18 @@ func Dial(ctx context.Context, host, room string, debug, insecure bool) (*Conn, 
 	ws.SetReadLimit(1 << 20)
 
 	c := &Conn{
-		tr:         &wsTransport{ws: ws},
-		host:       host,
-		room:       room,
-		mucDomain:  cfg.mucDomain,
-		xmppDomain: cfg.xmppDomain,
-		debug:      debug,
-		occupants:  make(map[string]struct{}),
-		stanzas:    make(chan string, 64),
-		jingles:    make(chan string, 8),
-		closed:     make(chan struct{}),
-		iqWaiters:  make(map[string]chan string),
+		tr:           &wsTransport{ws: ws},
+		host:         host,
+		room:         room,
+		mucDomain:    cfg.mucDomain,
+		xmppDomain:   cfg.xmppDomain,
+		streamDomain: cfg.streamDomain,
+		debug:        debug,
+		occupants:    make(map[string]struct{}),
+		stanzas:      make(chan string, 64),
+		jingles:      make(chan string, 8),
+		closed:       make(chan struct{}),
+		iqWaiters:    make(map[string]chan string),
 	}
 
 	if err := c.auth(ctx); err != nil {
@@ -199,16 +205,23 @@ func Dial(ctx context.Context, host, room string, debug, insecure bool) (*Conn, 
 type jitsiConfig struct {
 	mucDomain  string
 	xmppDomain string
-	websocket  string // full wss:// URL from config.websocket (without room param)
-	bosh       string // full URL from config.bosh
+	// streamDomain is the vhost used for <open to="..."> and SASL.
+	// Equals anonymousdomain from config.js when present (e.g.
+	// guest.meet.jit.si on public meet.jit.si where ANONYMOUS SASL
+	// is only advertised on the guest vhost), otherwise == xmppDomain.
+	// Service component IQs (focus.*, extdisco) keep using xmppDomain.
+	streamDomain string
+	websocket    string // full wss:// URL from config.websocket (without room param)
+	bosh         string // full URL from config.bosh
 }
 
 // fetchConfig downloads /config.js from the host and extracts MUC domain,
 // XMPP domain, WebSocket URL, and BOSH URL.
 func fetchConfig(host string, insecure bool) jitsiConfig {
 	cfg := jitsiConfig{
-		mucDomain:  "conference." + host,
-		xmppDomain: host,
+		mucDomain:    "conference." + host,
+		xmppDomain:   host,
+		streamDomain: host,
 	}
 	client := http.DefaultClient
 	if insecure {
@@ -216,6 +229,7 @@ func fetchConfig(host string, insecure bool) jitsiConfig {
 	}
 	resp, err := client.Get("https://" + host + "/config.js")
 	if err != nil {
+		log.Printf("j fetchConfig %s: GET failed: %v (using defaults)", host, err)
 		return cfg
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -224,6 +238,10 @@ func fetchConfig(host string, insecure bool) jitsiConfig {
 	body := string(buf[:n])
 	if v := extractStringField(body, "domain"); v != "" {
 		cfg.xmppDomain = v
+		cfg.streamDomain = v
+	}
+	if v := extractStringField(body, "anonymousdomain"); v != "" {
+		cfg.streamDomain = v
 	}
 	if v := extractStringField(body, "muc"); v != "" {
 		cfg.mucDomain = v
@@ -242,6 +260,8 @@ func fetchConfig(host string, insecure bool) jitsiConfig {
 		}
 		cfg.bosh = v
 	}
+	log.Printf("j fetchConfig %s: xmppDomain=%s streamDomain=%s mucDomain=%s",
+		host, cfg.xmppDomain, cfg.streamDomain, cfg.mucDomain)
 	return cfg
 }
 
@@ -687,7 +707,7 @@ func extractXMLAttr(s, attr string) string {
 }
 
 func (c *Conn) auth(ctx context.Context) error {
-	open := fmt.Sprintf(`<open to="%s" version="1.0" xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>`, c.xmppDomain)
+	open := fmt.Sprintf(`<open to="%s" version="1.0" xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>`, c.streamDomain)
 
 	// phase 1: open stream
 	if err := c.send(open); err != nil {
@@ -1339,18 +1359,19 @@ func dialBOSH(ctx context.Context, host, room string, debug, insecure bool, cfg 
 	}
 
 	c := &Conn{
-		tr:         bt,
-		host:       host,
-		room:       room,
-		mucDomain:  cfg.mucDomain,
-		xmppDomain: cfg.xmppDomain,
-		debug:      debug,
-		bosh:       true,
-		occupants:  make(map[string]struct{}),
-		stanzas:    make(chan string, 64),
-		jingles:    make(chan string, 8),
-		closed:     make(chan struct{}),
-		iqWaiters:  make(map[string]chan string),
+		tr:           bt,
+		host:         host,
+		room:         room,
+		mucDomain:    cfg.mucDomain,
+		xmppDomain:   cfg.xmppDomain,
+		streamDomain: cfg.streamDomain,
+		debug:        debug,
+		bosh:         true,
+		occupants:    make(map[string]struct{}),
+		stanzas:      make(chan string, 64),
+		jingles:      make(chan string, 8),
+		closed:       make(chan struct{}),
+		iqWaiters:    make(map[string]chan string),
 	}
 
 	if err := c.authBOSH(ctx, bt); err != nil {
